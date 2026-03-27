@@ -662,7 +662,7 @@ if __name__ == "__main__":
         print('evaluation environment is created')
 
         obs, _ = env_eval.reset()
-        obs_gpu = torch.from_numpy(obs).float().to(device)
+        obs_gpu = torch.from_numpy(obs).float().to(device).unsqueeze(0)  # Add batch dim for agent
         episodic_returns = []
         start_time = time.time()
         max_eval_steps = args.n_eval_episodes * 1000  # Safety timeout
@@ -672,10 +672,10 @@ if __name__ == "__main__":
         while len(episodic_returns) < args.n_eval_episodes and eval_step < max_eval_steps:
             with torch.no_grad():
                 # always use deterministic action for evaluation
-                actions = agent.deterministic_action(obs_gpu)
-                next_obs_np, _, terminated, truncated, info = env_eval.step(actions.cpu().numpy())
+                actions = agent.deterministic_action(obs_gpu)  # Input: (1, obs_dim), Output: (1, action_dim)
+                next_obs_np, _, terminated, truncated, info = env_eval.step(actions.squeeze(0).cpu().numpy())  # Remove batch dim
 
-            obs_gpu = torch.from_numpy(next_obs_np).float().to(device)
+            obs_gpu = torch.from_numpy(next_obs_np).float().to(device).unsqueeze(0)  # Add batch dim back
             eval_step += 1
 
             # DEBUG: Print step info
@@ -690,7 +690,7 @@ if __name__ == "__main__":
                 print(f"  Episode {len(episodic_returns)+1} completed! Reward={reward:.4f}, Volume={info.get('volume', 'N/A')}")
                 episodic_returns.append(reward)
                 obs, _ = env_eval.reset()
-                obs_gpu = torch.from_numpy(obs).float().to(device)
+                obs_gpu = torch.from_numpy(obs).float().to(device).unsqueeze(0)  # Add batch dim for next episode
 
         env_eval.close()
         print(f'evaluation time: {time.time()-start_time:.1f}s')
