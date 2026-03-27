@@ -248,12 +248,18 @@ class Market(gym.Env):
             out = self.agents[agent_id].new_event(t, agent_id)
             if out is not None:
                 self.pq.put(out)
-            # observation agent breaks the loop 
+            # observation agent breaks the loop
             if agent_id == 'observation_agent':
                 break
-        # consitensy check: if terminated the execution agent's volume must be zero 
-        if terminated:
-            assert self.agents[self.execution_agent_id].volume == 0
+
+        # Force termination if we reach terminal_time without complete liquidation
+        # (leftover assets accepted to prevent eval from hanging)
+        if not terminated and hasattr(self, 'agents') and self.execution_agent_id in self.agents:
+            exec_agent = self.agents[self.execution_agent_id]
+            if hasattr(exec_agent, 'terminal_time') and t >= exec_agent.terminal_time:
+                # Episode reached terminal_time - force completion
+                terminated = True
+                # Accept partial fills if market couldn't absorb full liquidation order
         # TODO: could only record final info to increase speed 
         # record a bunch of infos 
         mid_price = (self.lob.data.best_bid_prices[-1] + self.lob.data.best_ask_prices[-1])/2

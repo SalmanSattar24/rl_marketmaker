@@ -619,8 +619,8 @@ class ExecutionAgent():
         return (cash - volume * self.reference_bid_price) / self.initial_volume
     
     def update_position_from_message_list(self, message_list):
-        rewards = [self.update_position(m) for m in message_list]                
-        assert self.volume >= 0         
+        rewards = [self.update_position(m) for m in message_list]
+        assert self.volume >= 0
         terminated = self.volume == 0
         return sum(rewards), terminated
 
