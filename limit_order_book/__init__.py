@@ -7,7 +7,8 @@ This package implements a microstructure simulator with:
 - Inventory tracking
 """
 
-from limit_order_book.limit_order_book import (
+# Use relative import to avoid nested package issues
+from .limit_order_book import (
     LimitOrder,
     MarketOrder,
     Cancellation,

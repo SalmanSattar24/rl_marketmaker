@@ -3,13 +3,13 @@
  - TODO: add market making agent 
 '''
 import sys
-import os 
+import os
 current = os.path.dirname(os.path.realpath(__file__))
 parent = os.path.dirname(current)
 sys.path.append(parent)
 import numpy as np
-from limit_order_book.limit_order_book import LimitOrder, MarketOrder, CancellationByPriceVolume, Cancellation
-from config.config import noise_agent_config
+from limit_order_book import LimitOrder, MarketOrder, CancellationByPriceVolume, Cancellation
+from config import noise_agent_config
 import bisect 
 
 class NoiseAgent(): 

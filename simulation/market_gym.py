@@ -1,13 +1,12 @@
-import os, sys 
+import os, sys
 current_path = os.path.dirname(os.path.realpath(__file__))
 parent_dir = os.path.dirname(current_path)
 sys.path.append(parent_dir)
 from simulation.agents import NoiseAgent, LinearSubmitLeaveAgent, StrategicAgent, SubmitAndLeaveAgent, MarketAgent, InitialAgent, ObservationAgent, RLAgent
-from limit_order_book.limit_order_book import LimitOrderBook
-from config.config import noise_agent_config, strategic_agent_config, sl_agent_config, linear_sl_agent_config, market_agent_config, initial_agent_config, observation_agent_config, rl_agent_config
+from limit_order_book import LimitOrderBook
+from config import noise_agent_config, strategic_agent_config, sl_agent_config, linear_sl_agent_config, market_agent_config, initial_agent_config, observation_agent_config, rl_agent_config
 import numpy as np
-import pandas as pd 
-from config.config import noise_agent_config
+import pandas as pd
 from queue import PriorityQueue
 from dataclasses import dataclass, field
 from typing import Any
