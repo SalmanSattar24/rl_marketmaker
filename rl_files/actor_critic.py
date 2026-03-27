@@ -645,53 +645,51 @@ if __name__ == "__main__":
         print(f"model saved to {model_path}")
     
     if args.evaluate:
-        # deterministic_actions 
+        # deterministic_actions
         print('\n starting evaluation')
         print('using deterministic actions for evaluation')
-        # tag = 'deterministic_action'
-        configs = [{'market_env': args.env_type , 'execution_agent': 'rl_agent', 'volume': args.num_lots, 
-                    'seed': args.eval_seed+s, 'terminal_time': args.terminal_time, 'time_delta': args.time_delta, 'drop_feature': args.drop_feature} for s in range(args.num_envs)]
+
+        # Use single environment for evaluation (faster, cleaner termination)
+        eval_num_envs = 1
+        configs = [{'market_env': args.env_type , 'execution_agent': 'rl_agent', 'volume': args.num_lots,
+                    'seed': args.eval_seed+s, 'terminal_time': args.terminal_time, 'time_delta': args.time_delta, 'drop_feature': args.drop_feature} for s in range(eval_num_envs)]
         if args.exp_name == 'normal':
-            configs = [{'market_env': args.env_type , 'execution_agent': 'rl_agent', 'volume': args.num_lots, 
-                        'seed': args.eval_seed+s, 'terminal_time': args.terminal_time, 'time_delta': args.time_delta, 'transform_action': True, 'drop_feature': args.drop_feature} for s in range(args.num_envs)]
+            configs = [{'market_env': args.env_type , 'execution_agent': 'rl_agent', 'volume': args.num_lots,
+                        'seed': args.eval_seed+s, 'terminal_time': args.terminal_time, 'time_delta': args.time_delta, 'transform_action': True, 'drop_feature': args.drop_feature} for s in range(eval_num_envs)]
         print('evalutation config:')
         print(configs[0])
         env_fns = [make_env(config) for config in configs]
-        envs = gym.vector.AsyncVectorEnv(env_fns=env_fns)
+        envs_eval = gym.vector.AsyncVectorEnv(env_fns=env_fns)
         print('evalutation environment is created')
-        obs, _ = envs.reset()
-
-        # PHASE 1: Setup pinned memory buffer for evaluation
-        eval_pinned_buffer = PinnedMemoryBuffer(
-            num_envs=args.num_envs,
-            obs_shape=envs.single_observation_space.shape,
-            device=device,
-            enable_async=True
-        )
+        obs, _ = envs_eval.reset()
 
         obs_gpu = torch.from_numpy(obs).float().to(device)
         episodic_returns = []
         start_time = time.time()
-        while len(episodic_returns) < args.n_eval_episodes:
+        max_eval_steps = args.n_eval_episodes * 1000  # Safety timeout
+        eval_step = 0
+
+        print(f'Running {args.n_eval_episodes} evaluation episodes (deterministic actions)...')
+        while len(episodic_returns) < args.n_eval_episodes and eval_step < max_eval_steps:
             with torch.no_grad():
                 # always use deterministic action for evaluation
                 actions = agent.deterministic_action(obs_gpu)
-                next_obs_np, _, _, _, infos = envs.step(actions.cpu().numpy())
+                next_obs_np, _, terminated, truncated, infos = envs_eval.step(actions.cpu().numpy())
 
-            # Use pinned memory for transfer
-            obs_gpu, _, _ = eval_pinned_buffer.transfer_to_device(
-                next_obs_np,
-                np.zeros(args.num_envs),  # dummy rewards
-                np.zeros(args.num_envs)   # dummy dones
-            )
+            obs_gpu = torch.from_numpy(next_obs_np).float().to(device)
+            eval_step += 1
 
             if "final_info" in infos:
-                for info in infos["final_info"]:
+                for i, info in enumerate(infos["final_info"]):
                     if info is not None:
                         episodic_returns.append(info['reward'])
-        print(f'evaluation time: {time.time()-start_time}')
-        print(f'reward length: {len(episodic_returns)}')
-        rewards = np.array(episodic_returns)        
+                        obs, _ = envs_eval.reset()
+                        obs_gpu = torch.from_numpy(obs).float().to(device)
+
+        envs_eval.close()
+        print(f'evaluation time: {time.time()-start_time:.1f}s')
+        print(f'reward length: {len(episodic_returns)}/{args.n_eval_episodes}')
+        rewards = np.array(episodic_returns)
         assert args.run_name is not None, "run_name should be set"
         # use tags such as long_horizon, GAE, or whatever
         file_name = f'{parent_dir}/rewards/{args.run_name}.npz'
