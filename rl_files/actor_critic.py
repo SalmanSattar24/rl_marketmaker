@@ -649,20 +649,19 @@ if __name__ == "__main__":
         print('\n starting evaluation')
         print('using deterministic actions for evaluation')
 
-        # Use single environment for evaluation (faster, cleaner termination)
-        eval_num_envs = 1
-        configs = [{'market_env': args.env_type , 'execution_agent': 'rl_agent', 'volume': args.num_lots,
-                    'seed': args.eval_seed+s, 'terminal_time': args.terminal_time, 'time_delta': args.time_delta, 'drop_feature': args.drop_feature} for s in range(eval_num_envs)]
-        if args.exp_name == 'normal':
-            configs = [{'market_env': args.env_type , 'execution_agent': 'rl_agent', 'volume': args.num_lots,
-                        'seed': args.eval_seed+s, 'terminal_time': args.terminal_time, 'time_delta': args.time_delta, 'transform_action': True, 'drop_feature': args.drop_feature} for s in range(eval_num_envs)]
-        print('evalutation config:')
-        print(configs[0])
-        env_fns = [make_env(config) for config in configs]
-        envs_eval = gym.vector.AsyncVectorEnv(env_fns=env_fns)
-        print('evalutation environment is created')
-        obs, _ = envs_eval.reset()
+        # Use SINGLE non-vectorized environment to avoid AsyncVectorEnv final_info issues
+        config = {'market_env': args.env_type, 'execution_agent': 'rl_agent', 'volume': args.num_lots,
+                  'seed': args.eval_seed, 'terminal_time': args.terminal_time, 'time_delta': args.time_delta,
+                  'drop_feature': args.drop_feature}
+        print('evaluation config:')
+        print(config)
 
+        # Create single Market environment directly (not vectorized)
+        from simulation.market_gym import Market
+        env_eval = Market(config)
+        print('evaluation environment is created')
+
+        obs, _ = env_eval.reset()
         obs_gpu = torch.from_numpy(obs).float().to(device)
         episodic_returns = []
         start_time = time.time()
@@ -674,7 +673,7 @@ if __name__ == "__main__":
             with torch.no_grad():
                 # always use deterministic action for evaluation
                 actions = agent.deterministic_action(obs_gpu)
-                next_obs_np, _, terminated, truncated, infos = envs_eval.step(actions.cpu().numpy())
+                next_obs_np, _, terminated, truncated, info = env_eval.step(actions.cpu().numpy())
 
             obs_gpu = torch.from_numpy(next_obs_np).float().to(device)
             eval_step += 1
@@ -682,19 +681,18 @@ if __name__ == "__main__":
             # DEBUG: Print step info
             if eval_step % 100 == 0:
                 print(f"  Step {eval_step}: Episodes={len(episodic_returns)}, "
-                      f"Terminated={terminated}, Truncated={truncated}, "
-                      f"Has final_info={'final_info' in infos}, "
-                      f"Remaining volume={infos.get('volume', [None])[0] if 'volume' in infos else 'N/A'}")
+                      f"Terminated={terminated}, "
+                      f"Remaining volume={info.get('volume', 'N/A')}")
 
-            if "final_info" in infos:
-                for i, info in enumerate(infos["final_info"]):
-                    if info is not None:
-                        print(f"  Episode {len(episodic_returns)+1} completed! Reward={info['reward']:.4f}, Volume={info.get('volume', 'N/A')}")
-                        episodic_returns.append(info['reward'])
-                        obs, _ = envs_eval.reset()
-                        obs_gpu = torch.from_numpy(obs).float().to(device)
+            # For non-vectorized env, check terminated directly
+            if terminated:
+                reward = info['reward']
+                print(f"  Episode {len(episodic_returns)+1} completed! Reward={reward:.4f}, Volume={info.get('volume', 'N/A')}")
+                episodic_returns.append(reward)
+                obs, _ = env_eval.reset()
+                obs_gpu = torch.from_numpy(obs).float().to(device)
 
-        envs_eval.close()
+        env_eval.close()
         print(f'evaluation time: {time.time()-start_time:.1f}s')
         print(f'reward length: {len(episodic_returns)}/{args.n_eval_episodes}')
 
