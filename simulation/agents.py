@@ -648,16 +648,16 @@ class ExecutionAgent():
         elif fill_message.type == 'cancellation_by_price_volume':
             # Note: cancellation by price and volume could also return a list of cancellations and modifications
             if fill_message.order.agent_id == self.agent_id:
-                self.active_volume -= fill_message.filled_volume
+                self.active_volume -= int(fill_message.filled_volume)
             else:
                 pass
         elif fill_message.type == 'limit':
             if fill_message.agent_id == self.agent_id:
-                # this means the limit order was send into the book by the agent 
-                self.active_volume += fill_message.volume
+                # this means the limit order was send into the book by the agent
+                self.active_volume += int(fill_message.volume)
         elif fill_message.type == 'cancellation':
             if fill_message.order.agent_id == self.agent_id:
-                self.active_volume -= fill_message.volume
+                self.active_volume -= int(fill_message.volume)
         elif fill_message.type == 'market':
             # check for active market trades
             # BILATERAL MM: Both buy and sell orders now allowed (removed one-sided assertions)
@@ -665,14 +665,14 @@ class ExecutionAgent():
             if fill_message.order.agent_id == self.agent_id:
                 # ask means buy --> volume increases, negative cash flow
                 if side == 'ask':
-                    self.volume += fill_message.filled_volume
-                    self.market_buys += fill_message.filled_volume
+                    self.volume += int(fill_message.filled_volume)
+                    self.market_buys += int(fill_message.filled_volume)
                     reward -= self.get_reward(fill_message.execution_price, fill_message.filled_volume)
                     self.cummulative_reward -= reward
                 # bid means sell --> volume decreases, positive cash flow
                 elif side == 'bid':
-                    self.volume -= fill_message.filled_volume
-                    self.market_sells += fill_message.filled_volume
+                    self.volume -= int(fill_message.filled_volume)
+                    self.market_sells += int(fill_message.filled_volume)
                     reward += self.get_reward(fill_message.execution_price, fill_message.filled_volume)
                     self.cummulative_reward += reward
             # check for passive limit order fills
@@ -681,8 +681,8 @@ class ExecutionAgent():
                 cash = 0
                 volume = 0
                 for m in fill_message.passive_fills[self.agent_id]:
-                    volume += m.filled_volume
-                    cash += m.filled_volume * m.order.price
+                    volume += int(m.filled_volume)
+                    cash += int(m.filled_volume) * m.order.price
                 # market side is ask, market buy --> limit sell
                 if side == 'ask':
                     self.active_volume -= volume
@@ -1136,7 +1136,9 @@ class RLAgent(ExecutionAgent):
             bid_target_volumes = []
             available_bid_volume = buy_volume_target
             for l in range(len(bid_action)):
-                volume_on_level = min(np.round(bid_action[l] * buy_volume_target).astype(int), available_bid_volume)
+                # Use floor to avoid over-allocation, then add leftovers at the end
+                volume_on_level = int(bid_action[l] * buy_volume_target)
+                volume_on_level = min(volume_on_level, available_bid_volume)
                 available_bid_volume -= volume_on_level
                 bid_target_volumes.append(volume_on_level)
             bid_target_volumes[-1] += available_bid_volume  # Add leftovers to inactive
@@ -1165,7 +1167,9 @@ class RLAgent(ExecutionAgent):
             ask_target_volumes = []
             available_ask_volume = sell_volume_target
             for l in range(len(ask_action)):
-                volume_on_level = min(np.round(ask_action[l] * sell_volume_target).astype(int), available_ask_volume)
+                # Use floor to avoid over-allocation, then add leftovers at the end
+                volume_on_level = int(ask_action[l] * sell_volume_target)
+                volume_on_level = min(volume_on_level, available_ask_volume)
                 available_ask_volume -= volume_on_level
                 ask_target_volumes.append(volume_on_level)
             ask_target_volumes[-1] += available_ask_volume  # Add leftovers to inactive
