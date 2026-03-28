@@ -653,11 +653,11 @@ class ExecutionAgent():
             if fill_message.order.agent_id == self.agent_id:
                 self.active_volume -= fill_message.volume
         elif fill_message.type == 'market':
-            # check for active market trades             
+            # check for active market trades
+            # BILATERAL MM: Both buy and sell orders now allowed (removed one-sided assertions)
             side = fill_message.order.side
             if fill_message.order.agent_id == self.agent_id:
-                assert side == 'bid', 'this execution agent only sells'
-                # ask means buy --> volume increases, negative cash flow 
+                # ask means buy --> volume increases, negative cash flow
                 if side == 'ask':
                     self.volume += fill_message.filled_volume
                     self.market_buys += fill_message.filled_volume
@@ -669,15 +669,15 @@ class ExecutionAgent():
                     self.market_sells += fill_message.filled_volume
                     reward += self.get_reward(fill_message.execution_price, fill_message.filled_volume)
                     self.cummulative_reward += reward
-            # check for passive limit order fills 
+            # check for passive limit order fills
+            # BILATERAL MM: Both buy and sell passive fills allowed (removed one-sided assertion)
             if self.agent_id in fill_message.passive_fills:
-                assert side == 'ask', 'this execution agent only sells'
                 cash = 0
-                volume = 0 
+                volume = 0
                 for m in fill_message.passive_fills[self.agent_id]:
                     volume += m.filled_volume
-                    cash += m.filled_volume * m.order.price 
-                # market side is ask, market buy --> limit sell 
+                    cash += m.filled_volume * m.order.price
+                # market side is ask, market buy --> limit sell
                 if side == 'ask':
                     self.active_volume -= volume
                     self.volume -= volume
