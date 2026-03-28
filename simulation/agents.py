@@ -1078,11 +1078,10 @@ class RLAgent(ExecutionAgent):
         else:
             return None
 
-    # BILATERAL MM: Phase 2+ - Bilateral order generation (to be implemented)
     def _generate_bilateral_orders(self, lob, time, bid_action, ask_action):
         """
         Generate bilateral (buy and sell) orders simultaneously.
-        Phase 2.2+: To be implemented when policy network supports dual actions.
+        Phase 3+: Full bilateral market-making implementation.
 
         Args:
             lob: Limit order book state
@@ -1093,15 +1092,96 @@ class RLAgent(ExecutionAgent):
         Returns:
             order_list: List of orders (bid and ask side)
 
-        TODO (Phase 2.3):
-            - Implement bid-side order generation (market buys + limit buys at bid_side levels)
-            - Implement ask-side order generation (market sells + limit sells at ask_side levels)
-            - Combine into unified order list respecting inventory quotas
-            - Use hard constraints to prevent breaching inventory limits
+        Generates market and limit orders on both sides:
+            - Bid side: Market buys + limit buys below best bid
+            - Ask side: Market sells + limit sells above best ask
         """
-        # Placeholder: For now, just use unilateral logic as fallback
-        # This ensures backward compatibility during Phase 2 development
-        return self._generate_unilateral_orders(lob, time, ask_action)
+        if time >= self.start_time and time < self.terminal_time:
+            # Validate actions
+            assert np.all(bid_action >= 0), 'bid_action values must be >= 0'
+            assert np.all(ask_action >= 0), 'ask_action values must be >= 0'
+            assert np.abs(np.sum(bid_action)-1) < 1e-6, 'bid_action must sum to 1'
+            assert np.abs(np.sum(ask_action)-1) < 1e-6, 'ask_action must sum to 1'
+
+            best_bid = lob.get_best_price('bid')
+            best_ask = lob.get_best_price('ask')
+
+            # Get current position on each side
+            volume_per_level, orders_within_range = self.get_order_allocation(lob, self.action_book_levels)
+            volume_per_level.insert(0, 0)  # Add market level marker
+
+            # Split volume: use proportional allocation based on action magnitudes
+            # Heuristic: if ask_action is stronger (higher market %), sell more; if bid_action stronger, buy more
+            ask_market_pct = ask_action[0]
+            bid_market_pct = bid_action[0]
+            total_market_strength = ask_market_pct + bid_market_pct + 1e-6  # Avoid division by zero
+
+            # Allocate volume: can buy up to 50% of volume (inventory limit), sell up to 50%
+            max_buy_volume = min(int(self.volume / 2), self.volume - self.active_volume)
+            max_sell_volume = min(int(self.volume / 2), self.volume - self.active_volume)
+
+            # Scale by market strength (if both high, reduce both)
+            buy_volume_target = int(max_buy_volume * bid_market_pct / total_market_strength)
+            sell_volume_target = int(max_sell_volume * ask_market_pct / total_market_strength)
+
+            order_list = []
+
+            # ========== BID SIDE (BUYING) ==========
+            bid_target_volumes = []
+            available_bid_volume = buy_volume_target
+            for l in range(len(bid_action)):
+                volume_on_level = min(np.round(bid_action[l] * buy_volume_target).astype(int), available_bid_volume)
+                available_bid_volume -= volume_on_level
+                bid_target_volumes.append(volume_on_level)
+            bid_target_volumes[-1] += available_bid_volume  # Add leftovers to inactive
+
+            # Cancel existing bid orders outside range
+            bid_orders_to_cancel = lob.order_map_by_agent.get(self.agent_id, set()).copy()
+            for order_id in bid_orders_to_cancel:
+                order = lob.order_map[order_id]
+                if order.side == 'ask':  # Buying means we place 'ask' orders in our record (inverted logic in LOB)
+                    order_list.append(Cancellation(self.agent_id, order_id, time))
+
+            # Place bid side orders
+            for level in range(1, len(bid_action)):  # Skip market level (level 0)
+                if bid_target_volumes[level] > 0:
+                    # Bid side: limit buy orders at bid_price - level
+                    limit_price = best_bid - level
+                    if limit_price > 0:
+                        order_list.append(LimitOrder(self.agent_id, 'bid', limit_price, bid_target_volumes[level], time))
+
+            # Place market bid orders if specified
+            if bid_target_volumes[0] > 0:
+                order = MarketOrder(self.agent_id, 'ask', bid_target_volumes[0], time)
+                order_list.append(order)
+
+            # ========== ASK SIDE (SELLING) ==========
+            ask_target_volumes = []
+            available_ask_volume = sell_volume_target
+            for l in range(len(ask_action)):
+                volume_on_level = min(np.round(ask_action[l] * sell_volume_target).astype(int), available_ask_volume)
+                available_ask_volume -= volume_on_level
+                ask_target_volumes.append(volume_on_level)
+            ask_target_volumes[-1] += available_ask_volume  # Add leftovers to inactive
+
+            # Place ask side orders
+            for level in range(1, len(ask_action)):  # Skip market level (level 0)
+                if ask_target_volumes[level] > 0:
+                    # Ask side: limit sell orders at ask_price + level
+                    limit_price = best_ask + level
+                    order_list.append(LimitOrder(self.agent_id, 'ask', limit_price, ask_target_volumes[level], time))
+
+            # Place market ask orders if specified
+            if ask_target_volumes[0] > 0:
+                order = MarketOrder(self.agent_id, 'bid', ask_target_volumes[0], time)
+                order_list.append(order)
+
+            return order_list
+
+        elif time == self.terminal_time:
+            return self.sell_remaining_position(lob, time)
+        else:
+            return None
 
     def get_observation(self, time, lob):        
         """
