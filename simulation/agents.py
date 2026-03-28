@@ -634,7 +634,13 @@ class ExecutionAgent():
         assert self.market_buys >= 0
         assert self.market_sells >= 0
         assert self.active_volume <= self.volume
-        assert self.market_buys + self.market_sells + self.limit_buys + self.limit_sells <= self.initial_volume
+        # Bilateral MM: can have both buy and sell orders active simultaneously
+        # So the sum can exceed initial_volume (e.g., 20 buys + 20 sells = 40 for 40 unit problem)
+        # Only check that individual sides don't exceed initial_volume
+        assert (self.market_buys + self.limit_buys) <= self.initial_volume, \
+            f"Total buy orders {self.market_buys + self.limit_buys} exceed initial_volume {self.initial_volume}"
+        assert (self.market_sells + self.limit_sells) <= self.initial_volume, \
+            f"Total sell orders {self.market_sells + self.limit_sells} exceed initial_volume {self.initial_volume}"
         if fill_message.type == 'modification':
             # this agent doesnt modify orders
             print('MODIFICATION but we do not update the position!')
