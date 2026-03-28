@@ -1257,67 +1257,53 @@ class RLAgent(ExecutionAgent):
         # queue_positions = queue_positions.flatten()
 
         # new queue position encoding
-        # TODO: volume encoding with level, queue position, and volume
-        # BILATERAL MM: Check both bid and ask sides for orders
+        # BILATERAL MM: Iterate through actual orders instead of price reconstruction
         levels = []
         queues = []
         volume_within_range = 0
 
-        # Check ASK side orders (sell orders above best_ask)
-        for level in range(1, self.observation_book_levels+1):
-            pos = 0
-            if self.start_at_best_price:
-                price = best_ask+level-1
-            else:
-                price = best_bid+level
-            if price in lob.price_map['ask']:
-                for id in lob.price_map['ask'][price]:
-                    volume = lob.order_map[id].volume
-                    agent_id = lob.order_map[id].agent_id
-                    if agent_id == self.agent_id:
-                        levels.extend(int(volume)*[level])
-                        queues.extend(list(range(int(pos), int(pos+volume))))
-                        volume_within_range += volume
-                    pos += volume
-            else:
-                pass
-
-        # Check BID side orders (buy orders below best_bid) - for bilateral MM
-        for level in range(1, self.observation_book_levels+1):
-            pos = 0
-            if self.start_at_best_price:
-                price = best_bid-level+1
-            else:
-                price = best_bid-level
-            if price in lob.price_map.get('bid', {}):  # Use .get() for safety
-                for id in lob.price_map['bid'][price]:
-                    volume = lob.order_map[id].volume
-                    agent_id = lob.order_map[id].agent_id
-                    if agent_id == self.agent_id:
-                        # Use negative level to distinguish buy from sell orders
-                        levels.extend(int(volume)*[-level])
-                        queues.extend(list(range(int(pos), int(pos+volume))))
-                        volume_within_range += volume
-                    pos += volume
-            else:
-                pass
+        # Get all orders for this agent currently in the LOB
+        if self.agent_id in lob.order_map_by_agent:
+            agent_orders = lob.order_map_by_agent[self.agent_id]
+            for order_id in agent_orders:
+                order = lob.order_map[order_id]
+                # Calculate level based on order price and side
+                if order.side == 'ask':
+                    # Sell orders: level = price - best_ask
+                    level = order.price - best_ask
+                    if 1 <= level <= self.observation_book_levels:
+                        levels.extend([level] * int(order.volume))
+                        volume_within_range += order.volume
+                    else:
+                        # Outside range, will be counted as volume_outside
+                        pass
+                elif order.side == 'bid':
+                    # Buy orders: level = best_bid - price (negative to distinguish)
+                    level = best_bid - order.price
+                    if 1 <= level <= self.observation_book_levels:
+                        levels.extend([-level] * int(order.volume))
+                        volume_within_range += order.volume
+                    else:
+                        # Outside range
+                        pass
 
         max_queue_size = 40
         # volume outside the price range or inactive
         volume_outside = self.volume - volume_within_range
-        assert 0 <= volume_outside <= self.volume
+        assert 0 <= volume_outside <= self.volume, f"volume_outside={volume_outside}, volume={self.volume}, volume_within_range={volume_within_range}"
         levels.extend([self.observation_book_levels+1]*int(volume_outside))
-        queues.extend([max_queue_size]*int(volume_outside))
+        queues.extend([0]*int(volume_outside))  # Placeholder queue positions for outside-range orders
 
         # filled volume
         filled_volume = self.initial_volume - self.volume
-        assert filled_volume+volume_within_range+volume_outside == self.initial_volume
+        assert filled_volume+volume_within_range+volume_outside == self.initial_volume, \
+            f"filled={filled_volume}, within={volume_within_range}, outside={volume_outside}, init={self.initial_volume}"
         levels.extend([-self.observation_book_levels]*int(filled_volume))
-        queues.extend([-max_queue_size]*int(filled_volume))
+        queues.extend([0]*int(filled_volume))  # Placeholder queue positions for filled volume
 
         # queues and levels
-        assert len(queues) == self.initial_volume
-        assert len(levels) == self.initial_volume
+        assert len(queues) == self.initial_volume, f"len(queues)={len(queues)}, initial_volume={self.initial_volume}"
+        assert len(levels) == self.initial_volume, f"len(levels)={len(levels)}, initial_volume={self.initial_volume}"
 
         # normalization 
         queues = np.array(queues, dtype=np.float32)/max_queue_size
