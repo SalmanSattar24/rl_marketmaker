@@ -58,8 +58,11 @@ class Market(gym.Env):
 
         # BILATERAL MM: Inventory management
         self.inventory_max = config.get('inventory_max', float('inf'))  # No limit by default
-        self.penalty_weight = config.get('penalty_weight', 1.0)  # Penalty multiplier for exceeding limits
+        self.penalty_weight = config.get('penalty_weight', 0.005)  # SOTA: Quadratic penalty multiplier
         self.agent_inventory = 0  # Net inventory starts at 0 (pure market-making)
+        self.time_weighted_inventory = 0
+        self.last_t = 0
+        self.circuit_breaker_triggered = False
         
         # set up initial agent          
         if config['market_env'] == 'noise':
@@ -193,6 +196,9 @@ class Market(gym.Env):
             self.agents[agent_id].reset()
         # BILATERAL MM: Reset inventory to 0 (pure market-making mode)
         self.agent_inventory = 0
+        self.time_weighted_inventory = 0
+        self.last_t = 0
+        self.circuit_breaker_triggered = False
         # initialize event queue
         self.pq = PriorityQueue()
         # set initial events
@@ -219,66 +225,61 @@ class Market(gym.Env):
         if action is not None:
             if self.transform_action:
                 action = np.exp(action) / np.sum(np.exp(action))
-        # n_events = 0  
+        
         while not self.pq.empty(): 
             # get next event from the event queue 
             t, priority, agent_id = self.pq.get()
+            
+            # BILATERAL MM: Update time-weighted metrics before processing new events
+            self.time_weighted_inventory += abs(self.agent_inventory) * (t - self.last_t)
+            self.last_t = t
+
             if t > self.agents[self.execution_agent_id].terminal_time:
                 # simulation should terminate at the execution agents terminal time
                 raise ValueError("time is greater than execution agents terminal time")
+            
             if agent_id == 'rl_agent':
-                # if rl agent is present, generate an order based, the agent used information from the LOB 
-                # orders could be None if agent doesnt change the current orders, but just leaves them in place 
                 orders = self.agents[agent_id].generate_order(lob=self.lob, time=t, action=action)
             else:
-                # this is either benchmark agent or observation agent 
-                # the observation agent does not return any orders 
-                # for the benchmark agents, no action is needed 
                 orders = self.agents[agent_id].generate_order(lob=self.lob, time=t)
-                # assert orders is not None
-            # update order book, and check whether execution agent orders have been filled 
-            # when can orders be None? 
-            # rl agent doesnt change anything. just leaves orders where they are. any other reason should not occur !
-            # note that rl agents returns empty list if it doesnt change anything
-            # looks like an error. orders == [] should not evaluate to True 
+
             if orders is not None or orders == []:
                 msgs = self.lob.process_order_list(orders)
                 # update execution agent position
-                # noise agent and strategic agent do not update their positions
-                # breack happens when execution agent is filled
-                # only execution agent has attribute updat_postion_from_message_list
-                # only update the execution agent. this could be RL or benchmark agent
                 reward, terminated = self.agents[self.execution_agent_id].update_position_from_message_list(msgs)
                 transition_reward += reward
 
-                # BILATERAL MM: Update net inventory from LOB and apply soft penalty if needed
+                # BILATERAL MM: Update net inventory and apply SOTA controls
                 self.agent_inventory = self.lob.agent_net_inventory.get(self.execution_agent_id, 0)
+                
+                # 1. SOTA: Quadratic Inventory Penalty (Running)
+                # Encourage small positions, punish large ones disproportionately
+                q_penalty = self.penalty_weight * (self.agent_inventory ** 2)
+                transition_reward -= q_penalty
+
+                # 2. SOTA: Hard Circuit Breaker (Termination + Shock Penalty)
                 if abs(self.agent_inventory) >= self.inventory_max:
-                    # Apply soft penalty for exceeding inventory limits
-                    excess_inventory = abs(self.agent_inventory) - self.inventory_max
-                    penalty = self.penalty_weight * excess_inventory
-                    transition_reward -= penalty
+                    transition_reward = -50.0  # Severe catastrophic reward to force policy avoidance
+                    terminated = True
+                    self.circuit_breaker_triggered = True
+                    break
 
                 if terminated:
                     break
-            # if not terminated or execution agent not present, generate a new event 
-            # can be None if there are no more events happening for the agent 
+
+            # generate a new event 
             out = self.agents[agent_id].new_event(t, agent_id)
             if out is not None:
                 self.pq.put(out)
+            
             # observation agent breaks the loop
             if agent_id == 'observation_agent':
                 break
 
         # Force termination if we reach terminal_time without complete liquidation
-        # Per paper: remaining inventory is implicitly penalized in reward calculation:
-        # reward = (cash - volume * reference_bid_price) / initial_volume
-        # Unsold shares don't contribute to 'cash', so incomplete execution gets lower reward
         if not terminated and hasattr(self, 'agents') and self.execution_agent_id in self.agents:
             exec_agent = self.agents[self.execution_agent_id]
             if hasattr(exec_agent, 'terminal_time') and t >= exec_agent.terminal_time:
-                # Episode reached terminal_time - force completion
-                # Note: Remaining inventory handled via implicit penalty in reward
                 terminated = True
         # TODO: could only record final info to increase speed
         # record a bunch of infos
@@ -291,8 +292,10 @@ class Market(gym.Env):
                 'n_events': self.agents['noise_agent'].n_events,
                 'terminated': terminated,
                 'volume': self.agents[self.execution_agent_id].volume,
-                'net_inventory': self.agent_inventory,  # BILATERAL MM: Add inventory tracking
-                'inventory_limit': self.inventory_max,  # BILATERAL MM: Add limit info
+                'net_inventory': self.agent_inventory,
+                'inventory_limit': self.inventory_max,
+                'time_weighted_inventory': self.time_weighted_inventory / (t + 1e-8),
+                'circuit_breaker': self.circuit_breaker_triggered
                 }
         if self.execution_agent_id == 'rl_agent':
             # if rl agent is present, get an observation from the market 

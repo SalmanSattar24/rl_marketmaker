@@ -921,11 +921,17 @@ class RLAgent(ExecutionAgent):
         self.terminal_time = terminal_time
         self.time_delta = time_delta
 
-        # BILATERAL MM: Inventory management
+        # BILATERAL MM: Inventory and OFI tracking
         self.inventory_max = inventory_max if inventory_max is not None else float('inf')
-        self.last_net_inventory = 0  # Track previous inventory for time-weighted computation
-        self.cumulative_abs_inventory_time = 0.0  # Track sum(|I(s)| * dt) for time-weighted feature
-        self.last_time = start_time  # Track previous time
+        self.last_net_inventory = 0
+        self.cumulative_abs_inventory_time = 0.0
+        self.last_time = start_time
+        
+        # SOTA: OFI Tracking
+        self.last_bid_price = 0
+        self.last_ask_price = 0
+        self.last_bid_vol = 0
+        self.last_ask_vol = 0
 
         # observation space length depends on features and queue positions, see the code below
         # note: adding queue positions did not improve the result in the flow 40 case
@@ -938,8 +944,8 @@ class RLAgent(ExecutionAgent):
         # bid and ask volumes: 5 + 5
         # levels and queue positions: 2*60
         # added cancellation imbalance features
-        # BILATERAL MM: +2 for normalized inventory and time-weighted inventory
-        self.observation_space_length = 6+4+6+5+5+2*int(volume)+1 + 2
+        # BILATERAL MM: +2 for inventory, +1 for OFI
+        self.observation_space_length = 6+4+6+5+5+2*int(volume)+1 + 2 + 1
         # adjusting observation space length if we drop features
         if self.drop_feature == 'volume':
             # 5 order book levels on each side + imbalance feature
@@ -1358,26 +1364,28 @@ class RLAgent(ExecutionAgent):
         mid_price_now = (lob.data.best_bid_prices[-1] + lob.data.best_ask_prices[-1])/2
         deltat_drift = np.array([(mid_price_now - mid_price_old)/10], dtype=np.float32)
 
-        # BILATERAL MM: Inventory features
-        # Get net inventory from LOB tracking
-        current_net_inventory = lob.agent_net_inventory.get(self.agent_id, 0)
-        # Update time-weighted inventory: sum(|I(s)| * dt)
-        dt = max(time - self.last_time, 0)
-        self.cumulative_abs_inventory_time += abs(current_net_inventory) * dt
-        self.last_time = time
+        # SOTA: Order Flow Imbalance (OFI)
+        curr_bid_p = lob.data.best_bid_prices[-1]
+        curr_ask_p = lob.data.best_ask_prices[-1]
+        curr_bid_v = lob.data.bid_volumes[-1][0] # best bid volume
+        curr_ask_v = lob.data.ask_volumes[-1][0] # best ask volume
 
-        # Normalized inventory: I(t) / I_max (range -1 to 1 or -inf to inf)
-        if self.inventory_max == float('inf'):
-            norm_inventory = np.clip(current_net_inventory / max(self.initial_volume, 1), -1.0, 1.0)
-        else:
-            norm_inventory = np.clip(current_net_inventory / max(self.inventory_max, 1), -1.0, 1.0)
+        # Formula: e_t = delta_VB_t - delta_VA_t
+        def get_delta_v(curr_p, curr_v, last_p, last_v, is_bid=True):
+            if np.isnan(last_p) or last_p == 0: return 0
+            if curr_p > last_p: return curr_v
+            if curr_p == last_p: return curr_v - last_v
+            return -last_v
 
-        # Time-weighted inventory: W(t) = cumulative_abs_inventory / (I_max * elapsed_time + epsilon)
-        elapsed_time = max(time - self.start_time, 0.1)  # Avoid division by zero
-        time_weighted_inventory = self.cumulative_abs_inventory_time / (self.inventory_max * elapsed_time) if self.inventory_max != float('inf') else 0.0
-        time_weighted_inventory = np.clip(time_weighted_inventory, 0.0, 1.0)
+        delta_vb = get_delta_v(curr_bid_p, curr_bid_v, self.last_bid_price, self.last_bid_vol, True)
+        delta_va = get_delta_v(curr_ask_p, curr_ask_v, self.last_ask_price, self.last_ask_vol, False)
+        ofi = (delta_vb - delta_va) / (max(curr_bid_v + curr_ask_v, 1)) # Normalize by total top-of-book volume
+        
+        # Update trackers
+        self.last_bid_price, self.last_ask_price = curr_bid_p, curr_ask_p
+        self.last_bid_vol, self.last_ask_vol = curr_bid_v, curr_ask_v
 
-        inventory_features = np.array([norm_inventory, time_weighted_inventory], dtype=np.float32)
+        inventory_features = np.array([norm_inventory, time_weighted_inventory, ofi], dtype=np.float32)
 
         if self.drop_feature == 'drift':
             # dropping drift from base features
