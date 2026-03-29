@@ -173,8 +173,11 @@ class PinnedMemoryBuffer:
             self.stream.synchronize()
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
+    if hasattr(layer, 'weight') and layer.weight is not None:
+        if layer.weight.dim() >= 2:
+            torch.nn.init.orthogonal_(layer.weight, std)
+    if hasattr(layer, 'bias') and layer.bias is not None:
+        torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
 class Agent(nn.Module):
