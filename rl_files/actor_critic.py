@@ -383,11 +383,13 @@ class BilateralAgentLogisticNormal(nn.Module):
         obs_shape = np.array(envs.single_observation_space.shape).prod()
         action_dim = np.prod(envs.single_action_space.shape) - 1  # -1 because last component is computed from others
 
-        # SHARED TRUNK: Common feature extraction
+        # SHARED TRUNK: Common feature extraction with LayerNorm for stability
         self.trunk = nn.Sequential(
             layer_init(nn.Linear(obs_shape, n_hidden_units)),
+            nn.LayerNorm(n_hidden_units),
             nn.Tanh(),
             layer_init(nn.Linear(n_hidden_units, n_hidden_units)),
+            nn.LayerNorm(n_hidden_units),
             nn.Tanh(),
         )
 
@@ -455,6 +457,10 @@ class BilateralAgentLogisticNormal(nn.Module):
             ask_std = torch.exp(self.log_std).expand_as(ask_mean)
 
         # Create distributions for bid and ask (independent)
+        # Stability: Ensure scale is strictly positive and non-zero
+        bid_std = torch.clamp(bid_std, min=1e-4)
+        ask_std = torch.clamp(ask_std, min=1e-4)
+        
         bid_dist = Normal(bid_mean, bid_std)
         ask_dist = Normal(ask_mean, ask_std)
 

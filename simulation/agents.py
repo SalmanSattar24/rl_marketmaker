@@ -1215,33 +1215,42 @@ class RLAgent(ExecutionAgent):
         # bid and mid price, spread
         best_bid = lob.data.best_bid_prices[-1]
         best_ask = lob.data.best_ask_prices[-1]
+        
+        # Stability: Handle cases where best bid/ask might be NaN or missing
+        if np.isnan(best_bid) or np.isnan(best_ask) or best_bid <= 0 or best_ask <= 0:
+            best_bid = self.reference_bid_price if self.reference_bid_price > 0 else 100.0
+            best_ask = self.reference_ask_price if self.reference_ask_price > 0 else 101.0
+
         mid_price = (best_bid + best_ask)/2
         bid_price_drift = (best_bid - self.reference_bid_price)/10
         mid_price_drift = (mid_price - self.reference_mid_price)/10
         spread = (best_ask - best_bid)/10        
+        
+        # Stability: Ensure spread as index is valid
+        safe_spread_idx = max(0, int(np.nan_to_num(spread) - 1))
 
         # volumes and imbalance 
         if self.start_at_best_price:
             bid_volumes = lob.data.bid_volumes[-1][:self.observation_book_levels]
             ask_volumes = lob.data.ask_volumes[-1][:self.observation_book_levels]        
         else:
-            bid_volumes = lob.data.bid_volumes[-1][int(spread-1):self.observation_book_levels+int(spread-1)]
-            ask_volumes = lob.data.ask_volumes[-1][int(spread-1):self.observation_book_levels+int(spread-1)]
-        if np.sum(bid_volumes+ask_volumes) == 0:
+            bid_volumes = lob.data.bid_volumes[-1][safe_spread_idx:self.observation_book_levels+safe_spread_idx]
+            ask_volumes = lob.data.ask_volumes[-1][safe_spread_idx:self.observation_book_levels+safe_spread_idx]
+        if np.sum(bid_volumes+ask_volumes) <= 1e-8:
             # print('first 5 bid+ask volumes are zero')
             # print(f'all bid vols: {lob.data.bid_volumes[-1]}')
             # print(f'all ask vols: {lob.data.ask_volumes[-1]}')
             imbalance = 0
         else:
-            imbalance = np.sum(bid_volumes - ask_volumes)/np.sum(bid_volumes + ask_volumes)
+            imbalance = np.sum(bid_volumes - ask_volumes) / (np.sum(bid_volumes + ask_volumes) + 1e-8)
             
         # normalize volumes through initial shape files 
         if self.start_at_best_price:
-            bid_volumes /= self.initial_shape[int(spread-1):self.observation_book_levels+int(spread-1)]
-            ask_volumes /= self.initial_shape[int(spread-1):self.observation_book_levels+int(spread-1)]
+            bid_volumes = bid_volumes / (self.initial_shape[safe_spread_idx:self.observation_book_levels+safe_spread_idx] + 1e-8)
+            ask_volumes = ask_volumes / (self.initial_shape[safe_spread_idx:self.observation_book_levels+safe_spread_idx] + 1e-8)
         else:
-            bid_volumes /= self.initial_shape[:self.observation_book_levels]
-            ask_volumes /= self.initial_shape[:self.observation_book_levels]
+            bid_volumes = bid_volumes / (self.initial_shape[:self.observation_book_levels] + 1e-8)
+            ask_volumes = ask_volumes / (self.initial_shape[:self.observation_book_levels] + 1e-8)
 
         # order distribution: orders on p1,p2,...,p(observation_book_levels), orders outside the range
         volume_per_level, _ = self.get_order_allocation(lob, self.observation_book_levels, start_at_best_price=self.start_at_best_price)
@@ -1340,26 +1349,26 @@ class RLAgent(ExecutionAgent):
         # market order imbalance 
         buys = [x for x, t in zip(lob.data.market_buy, lob.data.time_stamps) if t >= time-self.time_delta and t <= time]  
         sells = [x for x, t in zip(lob.data.market_sell, lob.data.time_stamps) if t >= time-self.time_delta and t <= time]  
-        if np.sum(buys) + np.sum(sells) == 0:
+        if np.sum(buys) + np.sum(sells) <= 1e-8:
             market_order_imbalance = 0
         else:
-            market_order_imbalance = (np.sum(buys) - np.sum(sells))/(np.sum(buys) + np.sum(sells))
+            market_order_imbalance = (np.sum(buys) - np.sum(sells))/(np.sum(buys) + np.sum(sells) + 1e-8)
         market_order_imbalance = np.array([market_order_imbalance], dtype=np.float32)
         # limit order imbalance 
         limit_buys = [x for x, t in zip(lob.data.limit_buy, lob.data.time_stamps) if t >= time-self.time_delta and t <= time]
         limit_sells = [x for x, t in zip(lob.data.limit_sell, lob.data.time_stamps) if t >= time-self.time_delta and t <= time]
-        if np.sum(limit_buys) + np.sum(limit_sells) == 0:
+        if np.sum(limit_buys) + np.sum(limit_sells) <= 1e-8:
             limit_order_imbalance = 0
         else:
-            limit_order_imbalance = (np.sum(limit_buys) - np.sum(limit_sells))/(np.sum(limit_buys) + np.sum(limit_sells))
+            limit_order_imbalance = (np.sum(limit_buys) - np.sum(limit_sells))/(np.sum(limit_buys) + np.sum(limit_sells) + 1e-8)
         limit_order_imbalance = np.array([limit_order_imbalance], dtype=np.float32)
         # 
         sell_order_cancellations = [x for x, t in zip(lob.data.cancellation_limit_sell, lob.data.time_stamps) if t >= time-self.time_delta and t <= time]
         buy_order_cancellations = [x for x, t in zip(lob.data.cancellation_limit_buy, lob.data.time_stamps) if t >= time-self.time_delta and t <= time]
-        if np.sum(sell_order_cancellations) + np.sum(buy_order_cancellations) == 0:
+        if np.sum(sell_order_cancellations) + np.sum(buy_order_cancellations) <= 1e-8:
             cancellation_imbalance = 0
         else:
-            cancellation_imbalance =  (np.sum(sell_order_cancellations) - np.sum(buy_order_cancellations))/(np.sum(sell_order_cancellations) + np.sum(buy_order_cancellations))
+            cancellation_imbalance =  (np.sum(sell_order_cancellations) - np.sum(buy_order_cancellations))/(np.sum(sell_order_cancellations) + np.sum(buy_order_cancellations) + 1e-8)
         cancellation_imbalance = np.array([cancellation_imbalance], dtype=np.float32)
 
         # mid price drift from t-delta t to t
@@ -1424,6 +1433,10 @@ class RLAgent(ExecutionAgent):
 
         # BILATERAL MM: Add inventory features to observation
         observation = np.concatenate([observation, inventory_features], dtype=np.float32)
+
+        # FINAL CLEANING: Remove NaNs and clip to prevent explosive values
+        observation = np.nan_to_num(observation, nan=0.0, posinf=100.0, neginf=-100.0)
+        observation = np.clip(observation, -100.0, 100.0)
 
         return observation
     
