@@ -215,7 +215,7 @@ class Market(gym.Env):
     
     def step(self, action=None):
         observation, reward ,terminated, info = self.transition(action)
-        if terminated:
+        if terminated and not self.circuit_breaker_triggered:
             assert self.agents[self.execution_agent_id].volume == 0
         return observation, reward, terminated, False, info 
 
