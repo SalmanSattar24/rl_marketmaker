@@ -1,6 +1,7 @@
 """
-Phase C: Paper-Faithful Simplification
+Phase C: Paper-Faithful Simplification (FIXED UNPACKING)
 Strips out custom penalties, increases trajectory count, uses paper's reward/hyperparams.
+Fixes the TypeError by correctly unpacking the bilateral action tuple.
 """
 import nbformat
 import os
@@ -49,53 +50,7 @@ print("[OK] Paper-Faithful Config loaded (noise, I_max=10, volume=10, T=150, dt=
 """
 
 # ============================================================
-# 2. CELL 21: Replace project_action_risk with paper's Q_max quota
-# ============================================================
-nb.cells[21].source = """import torch
-
-def project_action_quota(a, current_inv, side="bid", inventory_max=10, q_max_base=10):
-    \"\"\"
-    Paper-faithful quota projection.
-    Q_max = min(q_max_base, I_max - |I(t)|) per side per step.
-    
-    This mechanically prevents inventory overflow through the action space,
-    no artificial penalties needed.
-    \"\"\"
-    x = torch.clamp(a, min=1e-8)
-    
-    # Paper: Q_max = min(q_max_base, I_max - |I(t)|)
-    if side == "bid":
-        room = max(0.0, inventory_max - current_inv)  # Room to buy more
-    else:  # ask
-        room = max(0.0, inventory_max + current_inv)  # Room to sell more
-    
-    q_max = min(q_max_base, room)
-    
-    if q_max <= 0:
-        # No room: force everything to hold (last bucket)
-        result = torch.zeros_like(x)
-        result[..., -1] = 1.0
-        return result
-    
-    # Scale active mass (non-hold buckets) proportional to quota
-    volume = 10  # Must match TRAIN_CONFIG['volume']
-    active_mass_limit = q_max / volume
-    
-    active_mass = torch.sum(x[..., :-1], dim=-1, keepdim=True)
-    scale = torch.minimum(torch.ones_like(active_mass), active_mass_limit / (active_mass + 1e-8))
-    
-    x[..., :-1] *= scale
-    # Renormalize to ensure valid simplex
-    total = torch.sum(x, dim=-1, keepdim=True)
-    x = x / (total + 1e-8)
-    
-    return x
-
-print("[OK] Paper-faithful quota projection loaded (Q_max = min(10, I_max - |I(t)|))")
-"""
-
-# ============================================================
-# 3. CELL 22: Paper-faithful training loop
+# 3. CELL 22: Paper-faithful training loop (FIXED UNPACKING)
 # ============================================================
 nb.cells[22].source = r'''print("=" * 70)
 print("STEP 7: TRAIN BILATERAL AGENT (Paper-Faithful PPO)")
@@ -143,19 +98,20 @@ def quick_eval(agent, episodes=120, seed_base=20000):
         cfg = dict(EVAL_CONFIG)
         cfg['seed'] = seed_base + i
         m_raw = Market(cfg)
-        m = EnvWrapper(m_raw)
-        obs, _ = m.reset()
+        market_wrap = EnvWrapper(m_raw) # Correct wrapper use
+        obs, _ = market_wrap.reset()
         ep_ret = 0.0
         current_inventory = 0
 
         while True:
             obs_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
             with torch.no_grad():
+                # deterministic_action returns (bid, ask) tuple directly
                 bid_action, ask_action = agent.deterministic_action(obs_tensor)
                 bid_action = project_action_quota(bid_action, current_inventory, side="bid", inventory_max=EVAL_CONFIG['inventory_max'])
                 ask_action = project_action_quota(ask_action, current_inventory, side="ask", inventory_max=EVAL_CONFIG['inventory_max'])
                 env_action = (bid_action[0].cpu().numpy(), ask_action[0].cpu().numpy())
-            obs, reward, terminated, truncated, info = m.step(env_action)
+            obs, reward, terminated, truncated, info = market_wrap.step(env_action)
             ep_ret += float(reward)
             current_inventory = info.get("net_inventory", 0)
             if terminated or truncated:
@@ -193,13 +149,15 @@ for iteration in range(NUM_TRAIN_ITERS):
 
         while True:
             obs_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
-            bid_action, ask_action, log_prob, value = bilateral_agent.get_action_and_value(obs_tensor)
+            # FIXED UNPACKING: get_action_and_value returns ((bid, ask), log_prob, entropy, value)
+            (bid_action, ask_action), log_prob, entropy, value = bilateral_agent.get_action_and_value(obs_tensor)
 
             # Paper-faithful quota projection
             bid_action = project_action_quota(bid_action, current_inventory, side="bid", inventory_max=TRAIN_CONFIG['inventory_max'])
             ask_action = project_action_quota(ask_action, current_inventory, side="ask", inventory_max=TRAIN_CONFIG['inventory_max'])
 
             # Recompute log prob after projection
+            # FIXED UNPACKING here as well
             _, log_prob_proj, _, _ = bilateral_agent.get_action_and_value(obs_tensor, action=(bid_action, ask_action))
 
             env_action = (bid_action[0].detach().cpu().numpy(), ask_action[0].detach().cpu().numpy())
@@ -208,7 +166,7 @@ for iteration in range(NUM_TRAIN_ITERS):
             # Update inventory
             current_inventory = info.get("net_inventory", 0)
 
-            # Paper-faithful reward: just use the raw reward from the environment
+            # Paper-faithful reward
             reward = float(reward)
 
             ep_obs.append(obs_tensor.squeeze(0).detach())
