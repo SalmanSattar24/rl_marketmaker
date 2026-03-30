@@ -1,0 +1,5 @@
+--- output 1 (stdout) ---
+[OK] Dual-regime setup ready. Default ACTIVE_ENV=flow
+[INFO] Planned sequence: ['flow', 'strategic']
+[TIP] Switch env with: set_active_env('strategic')
+

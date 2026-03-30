@@ -1,0 +1,15 @@
+[
+  {
+    "name": "stdout",
+    "output_type": "stream",
+    "text": [
+      "======================================================================\n",
+      "STEP 7A: VECTORIZED TRAINING SETUP\n",
+      "======================================================================\n",
+      "[HW] GPU=Tesla T4 | CPU cores=2\n",
+      "[OK] Vector env ready: 4 envs | BATCH_SIZE=256 | MINIBATCH=256\n",
+      "[OK] Vector backend: SyncVectorEnv\n",
+      "[OK] Action shape per env: (14,), obs shape: (43,)\n"
+    ]
+  }
+]

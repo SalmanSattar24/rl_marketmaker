@@ -1,0 +1,9 @@
+[
+  {
+    "name": "stdout",
+    "output_type": "stream",
+    "text": [
+      "[OK] SymmetricFixedSpreadAgent defined (returns tuple format)\n"
+    ]
+  }
+]

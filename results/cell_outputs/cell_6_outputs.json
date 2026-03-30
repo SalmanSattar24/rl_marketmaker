@@ -1,0 +1,12 @@
+[
+  {
+    "name": "stdout",
+    "output_type": "stream",
+    "text": [
+      "[INFO] Running in Google Colab\n",
+      "\n",
+      "[INSTALL] Installing PyTorch and dependencies...\n",
+      "[OK] Dependencies installed\n"
+    ]
+  }
+]

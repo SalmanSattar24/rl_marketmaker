@@ -1,0 +1,13 @@
+--- output 1 (stdout) ---
+[SETUP] Creating market environment...
+[INFO] Observation shape: (43,)
+[INFO] Action space: (7,)
+
+[SETUP] Creating bilateral RL agent...
+[OK] Bilateral agent on cuda
+
+[SETUP] Creating baseline agent...
+[OK] Baseline agent ready
+
+[SETUP] All agents created successfully
+

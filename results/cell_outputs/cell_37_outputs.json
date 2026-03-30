@@ -1,0 +1,13 @@
+[
+  {
+    "name": "stdout",
+    "output_type": "stream",
+    "text": [
+      "[OK] Results saved to 'phase4_results_flow.json'\n",
+      "\n",
+      "[INFO] You can download these files:\n",
+      "  - bilateral_mm_success_report_<env>.png (visualization)\n",
+      "  - phase4_results_<env>.json (raw data)\n"
+    ]
+  }
+]

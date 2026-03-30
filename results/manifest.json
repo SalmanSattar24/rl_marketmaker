@@ -1,0 +1,175 @@
+{
+  "source_notebook": "bilateral_mm_agent.ipynb",
+  "cells_with_outputs": [
+    {
+      "cell": 3,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_3_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_3_text.txt"
+    },
+    {
+      "cell": 5,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_5_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_5_text.txt"
+    },
+    {
+      "cell": 6,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_6_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_6_text.txt"
+    },
+    {
+      "cell": 8,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_8_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_8_text.txt"
+    },
+    {
+      "cell": 10,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_10_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_10_text.txt"
+    },
+    {
+      "cell": 11,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_11_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_11_text.txt"
+    },
+    {
+      "cell": 12,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_12_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_12_text.txt"
+    },
+    {
+      "cell": 14,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_14_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_14_text.txt"
+    },
+    {
+      "cell": 15,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_15_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_15_text.txt"
+    },
+    {
+      "cell": 17,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_17_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_17_text.txt"
+    },
+    {
+      "cell": 19,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_19_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_19_text.txt"
+    },
+    {
+      "cell": 21,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_21_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_21_text.txt"
+    },
+    {
+      "cell": 23,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_23_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_23_text.txt"
+    },
+    {
+      "cell": 24,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_24_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_24_text.txt"
+    },
+    {
+      "cell": 25,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_25_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_25_text.txt"
+    },
+    {
+      "cell": 27,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_27_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_27_text.txt"
+    },
+    {
+      "cell": 29,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_29_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_29_text.txt"
+    },
+    {
+      "cell": 31,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_31_outputs.json",
+      "mime_types": [
+        "text/html",
+        "text/plain"
+      ],
+      "text": "results\\text\\cell_31_text.txt"
+    },
+    {
+      "cell": 33,
+      "output_count": 2,
+      "json": "results\\cell_outputs\\cell_33_outputs.json",
+      "mime_types": [
+        "image/png",
+        "text/plain"
+      ],
+      "text": "results\\text\\cell_33_text.txt"
+    },
+    {
+      "cell": 35,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_35_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_35_text.txt"
+    },
+    {
+      "cell": 37,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_37_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_37_text.txt"
+    },
+    {
+      "cell": 38,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_38_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_38_text.txt"
+    },
+    {
+      "cell": 39,
+      "output_count": 1,
+      "json": "results\\cell_outputs\\cell_39_outputs.json",
+      "mime_types": [],
+      "text": "results\\text\\cell_39_text.txt"
+    }
+  ],
+  "images": [
+    "results\\images\\cell_33_img_1.png"
+  ]
+}

@@ -1,0 +1,19 @@
+[
+  {
+    "name": "stdout",
+    "output_type": "stream",
+    "text": [
+      "======================================================================\n",
+      "PHASE 6 VERIFICATION: CIRCUIT BREAKER 'CRASH TEST'\n",
+      "======================================================================\n",
+      "[SUCCESS] Circuit Breaker Triggered at Step 4!\n",
+      "[INFO] Final Inventory: 32.0\n",
+      "[INFO] Reward for break step: -5.8\n",
+      "\n",
+      "[RESULT] Triggered: True | Terminated on break: True | Total Reward: -11.10\n",
+      "VERIFICATION PASSED: Circuit breaker behavior matches current simulator logic (terminate on inventory breach, no fixed penalty).\n",
+      "[NOTE] Reward is not fixed at -50 by design in current simulator.\n",
+      "======================================================================\n"
+    ]
+  }
+]

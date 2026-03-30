@@ -1,0 +1,11 @@
+[
+  {
+    "name": "stdout",
+    "output_type": "stream",
+    "text": [
+      "[OK] All imports successful\n",
+      "[INFO] Using device: cuda\n",
+      "[OK] Random seeds set\n"
+    ]
+  }
+]

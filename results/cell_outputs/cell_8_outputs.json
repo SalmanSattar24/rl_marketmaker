@@ -1,0 +1,16 @@
+[
+  {
+    "name": "stdout",
+    "output_type": "stream",
+    "text": [
+      "[PULL] Updating existing repo at /content/rtle_parallelized\n",
+      "\n",
+      "[OK] Working directory: /content/rtle_parallelized\n",
+      "[VERIFY] Repository structure:\n",
+      "  [OK] simulation/\n",
+      "  [OK] rl_files/\n",
+      "  [OK] tests/\n",
+      "  [OK] limit_order_book/\n"
+    ]
+  }
+]

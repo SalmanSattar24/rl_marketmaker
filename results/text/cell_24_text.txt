@@ -1,0 +1,9 @@
+--- output 1 (stdout) ---
+======================================================================
+STEP 7A: VECTORIZED TRAINING SETUP
+======================================================================
+[HW] GPU=Tesla T4 | CPU cores=2
+[OK] Vector env ready: 4 envs | BATCH_SIZE=256 | MINIBATCH=256
+[OK] Vector backend: SyncVectorEnv
+[OK] Action shape per env: (14,), obs shape: (43,)
+

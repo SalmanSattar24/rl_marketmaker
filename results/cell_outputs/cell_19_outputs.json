@@ -1,0 +1,11 @@
+[
+  {
+    "name": "stdout",
+    "output_type": "stream",
+    "text": [
+      "[OK] Dual-regime setup ready. Default ACTIVE_ENV=flow\n",
+      "[INFO] Planned sequence: ['flow', 'strategic']\n",
+      "[TIP] Switch env with: set_active_env('strategic')\n"
+    ]
+  }
+]

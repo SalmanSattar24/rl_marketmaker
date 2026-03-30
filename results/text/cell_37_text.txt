@@ -1,0 +1,7 @@
+--- output 1 (stdout) ---
+[OK] Results saved to 'phase4_results_flow.json'
+
+[INFO] You can download these files:
+  - bilateral_mm_success_report_<env>.png (visualization)
+  - phase4_results_<env>.json (raw data)
+

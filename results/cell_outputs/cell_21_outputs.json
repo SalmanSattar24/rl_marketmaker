@@ -1,0 +1,19 @@
+[
+  {
+    "name": "stdout",
+    "output_type": "stream",
+    "text": [
+      "[SETUP] Creating market environment...\n",
+      "[INFO] Observation shape: (43,)\n",
+      "[INFO] Action space: (7,)\n",
+      "\n",
+      "[SETUP] Creating bilateral RL agent...\n",
+      "[OK] Bilateral agent on cuda\n",
+      "\n",
+      "[SETUP] Creating baseline agent...\n",
+      "[OK] Baseline agent ready\n",
+      "\n",
+      "[SETUP] All agents created successfully\n"
+    ]
+  }
+]

@@ -1,0 +1,10 @@
+--- output 1 (stdout) ---
+[PULL] Updating existing repo at /content/rtle_parallelized
+
+[OK] Working directory: /content/rtle_parallelized
+[VERIFY] Repository structure:
+  [OK] simulation/
+  [OK] rl_files/
+  [OK] tests/
+  [OK] limit_order_book/
+

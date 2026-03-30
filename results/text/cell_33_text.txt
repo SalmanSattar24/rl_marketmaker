@@ -1,0 +1,6 @@
+--- output 1 (text/plain) ---
+<Figure size 2000x1400 with 4 Axes>
+
+--- output 2 (stdout) ---
+[OK] Performance report and plots generated: bilateral_mm_success_report_flow.png
+

@@ -1,0 +1,6 @@
+--- output 1 (stdout) ---
+[INFO] Running in Google Colab
+
+[INSTALL] Installing PyTorch and dependencies...
+[OK] Dependencies installed
+
