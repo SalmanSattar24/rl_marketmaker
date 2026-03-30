@@ -79,7 +79,8 @@ print("-" * 70)
 
 try:
     # Get observation batch
-    obs_batch = torch.tensor([obs] * 4, dtype=torch.float32)  # Batch of 4
+    obs_batch_np = np.stack([obs] * 4, axis=0)
+    obs_batch = torch.as_tensor(obs_batch_np, dtype=torch.float32)  # Batch of 4
 
     # Sample bilateral actions
     actions, log_prob, entropy, value = bilateral_agent.get_action_and_value(obs_batch)
@@ -218,7 +219,8 @@ print("-" * 70)
 
 try:
     bilateral_agent = BilateralAgentLogisticNormal(market)
-    obs_batch = torch.tensor([obs] * 2, dtype=torch.float32)
+    obs_batch_np = np.stack([obs] * 2, axis=0)
+    obs_batch = torch.as_tensor(obs_batch_np, dtype=torch.float32)
     obs_batch.requires_grad = False
 
     # Forward pass

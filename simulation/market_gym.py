@@ -3,7 +3,7 @@ current_path = os.path.dirname(os.path.realpath(__file__))
 parent_dir = os.path.dirname(current_path)
 sys.path.append(parent_dir)
 from simulation.agents import NoiseAgent, LinearSubmitLeaveAgent, StrategicAgent, SubmitAndLeaveAgent, MarketAgent, InitialAgent, ObservationAgent, RLAgent
-from limit_order_book import LimitOrderBook
+from limit_order_book import LimitOrderBook, Cancellation, MarketOrder
 from config import noise_agent_config, strategic_agent_config, sl_agent_config, linear_sl_agent_config, market_agent_config, initial_agent_config, observation_agent_config, rl_agent_config
 import numpy as np
 import pandas as pd
@@ -63,6 +63,8 @@ class Market(gym.Env):
         self.time_weighted_inventory = 0
         self.last_t = 0
         self.circuit_breaker_triggered = False
+        self.reward_mark_to_mid_weight = float(config.get('reward_mark_to_mid_weight', 0.0))
+        self.previous_mid_price = None
         
         # set up initial agent          
         if config['market_env'] == 'noise':
@@ -156,6 +158,7 @@ class Market(gym.Env):
             rl_agent_config['drop_feature'] = config['drop_feature']
             # BILATERAL MM: Pass inventory_max to RLAgent
             rl_agent_config['inventory_max'] = self.inventory_max
+            rl_agent_config['use_ofi'] = bool(config.get('use_ofi', False))
             if config['market_env'] == 'noise':
                 rl_agent_config['initial_shape_file'] = f'{parent_dir}/initial_shape/noise_65.npz'
             else:
@@ -199,6 +202,7 @@ class Market(gym.Env):
         self.time_weighted_inventory = 0
         self.last_t = 0
         self.circuit_breaker_triggered = False
+        self.previous_mid_price = None
         # initialize event queue
         self.pq = PriorityQueue()
         # set initial events
@@ -210,6 +214,12 @@ class Market(gym.Env):
         # runs up to first observation or stops if the simulation is terminated
         # if there is no RL agent present and no observation agent present, transition will just run straight to the end without any intermediate action
         observation, reward, terminated, info = self.transition()
+
+        if self.lob.data.best_bid_prices and self.lob.data.best_ask_prices:
+            best_bid = self.lob.data.best_bid_prices[-1]
+            best_ask = self.lob.data.best_ask_prices[-1]
+            if not (np.isnan(best_bid) or np.isnan(best_ask)):
+                self.previous_mid_price = (best_bid + best_ask) / 2
 
         # Backward compatibility for benchmark-agent tests that expect zeroed inventory post-reset
         if self.execution_agent_id != 'rl_agent':
@@ -227,6 +237,8 @@ class Market(gym.Env):
     def transition(self, action=None):
         terminated = False
         transition_reward = 0 
+        terminal_closeout_reward = 0.0
+        t = self.last_t
         if action is not None:
             if self.transform_action:
                 action = np.exp(action) / np.sum(np.exp(action))
@@ -281,7 +293,27 @@ class Market(gym.Env):
         if not terminated and hasattr(self, 'agents') and self.execution_agent_id in self.agents:
             exec_agent = self.agents[self.execution_agent_id]
             if hasattr(exec_agent, 'terminal_time') and t >= exec_agent.terminal_time:
+                closeout_reward = self._closeout_terminal_inventory(t)
+                terminal_closeout_reward += closeout_reward
+                transition_reward += closeout_reward
                 terminated = True
+
+        inventory_reward = self._compute_inventory_reward_term()
+        transition_reward += inventory_reward
+
+        exec_agent = self.agents[self.execution_agent_id]
+        if hasattr(exec_agent, 'register_reward_components'):
+            # Realized component is inferred from cumulative bookkeeping and excludes inventory term.
+            # Terminal closeout reward is included inside realized if closeout orders executed.
+            step_realized = transition_reward - inventory_reward
+            exec_agent.register_reward_components(
+                realized=step_realized,
+                inventory=inventory_reward,
+                terminal=terminal_closeout_reward,
+            )
+        if inventory_reward != 0.0:
+            exec_agent.cummulative_reward += inventory_reward
+
         # TODO: could only record final info to increase speed
         # record a bunch of infos
         mid_price = (self.lob.data.best_bid_prices[-1] + self.lob.data.best_ask_prices[-1])/2
@@ -296,7 +328,10 @@ class Market(gym.Env):
                 'net_inventory': self.agent_inventory,
                 'inventory_limit': self.inventory_max,
                 'time_weighted_inventory': self.time_weighted_inventory / (t + 1e-8),
-                'circuit_breaker': self.circuit_breaker_triggered
+                'circuit_breaker': self.circuit_breaker_triggered,
+                'reward_realized_step': float(transition_reward - inventory_reward),
+                'reward_inventory_step': float(inventory_reward),
+                'reward_terminal_step': float(terminal_closeout_reward),
                 }
         if self.execution_agent_id == 'rl_agent':
             # if rl agent is present, get an observation from the market 
@@ -306,6 +341,61 @@ class Market(gym.Env):
             # benchmark agents return no observation 
             observation = np.array([None], dtype=np.float32)            
         return observation, transition_reward, terminated, info 
+
+    def _compute_inventory_reward_term(self):
+        """Optional mark-to-mid inventory component (disabled by default via weight=0)."""
+        if self.reward_mark_to_mid_weight == 0.0:
+            return 0.0
+        if not self.lob.data.best_bid_prices or not self.lob.data.best_ask_prices:
+            return 0.0
+
+        best_bid = self.lob.data.best_bid_prices[-1]
+        best_ask = self.lob.data.best_ask_prices[-1]
+        if np.isnan(best_bid) or np.isnan(best_ask):
+            return 0.0
+
+        mid_now = (best_bid + best_ask) / 2.0
+        if self.previous_mid_price is None:
+            self.previous_mid_price = mid_now
+            return 0.0
+
+        initial_volume = max(float(self.agents[self.execution_agent_id].initial_volume), 1.0)
+        inventory_term = self.reward_mark_to_mid_weight * ((mid_now - self.previous_mid_price) * self.agent_inventory) / initial_volume
+        self.previous_mid_price = mid_now
+        return float(inventory_term)
+
+    def _closeout_terminal_inventory(self, time):
+        """Deterministically cancel active orders and flatten net inventory at terminal time."""
+        exec_id = self.execution_agent_id
+        net_inventory = int(self.lob.agent_net_inventory.get(exec_id, 0))
+
+        if net_inventory == 0 and len(self.lob.order_map_by_agent.get(exec_id, set())) == 0:
+            return 0.0
+
+        order_list = []
+        for order_id in list(self.lob.order_map_by_agent.get(exec_id, set())):
+            order_list.append(Cancellation(agent_id=exec_id, order_id=order_id, time=time))
+
+        if net_inventory > 0:
+            # Long inventory -> aggressive sell (hit bid book)
+            side = 'bid'
+            if not self.lob.price_volume_map['bid'] and self.lob.price_volume_map['ask']:
+                side = 'ask'
+            order_list.append(MarketOrder(agent_id=exec_id, side=side, volume=abs(net_inventory), time=time))
+        elif net_inventory < 0:
+            # Short inventory -> aggressive buy (hit ask book)
+            side = 'ask'
+            if not self.lob.price_volume_map['ask'] and self.lob.price_volume_map['bid']:
+                side = 'bid'
+            order_list.append(MarketOrder(agent_id=exec_id, side=side, volume=abs(net_inventory), time=time))
+
+        if not order_list:
+            return 0.0
+
+        msgs = self.lob.process_order_list(order_list)
+        reward, _ = self.agents[exec_id].update_position_from_message_list(msgs)
+        self.agent_inventory = self.lob.agent_net_inventory.get(exec_id, 0)
+        return float(reward)
 
 def make_env(config):
     def thunk():

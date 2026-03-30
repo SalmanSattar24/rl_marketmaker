@@ -608,11 +608,37 @@ class ExecutionAgent():
         self.volume = self.initial_volume
         self.active_volume = 0
         self.cummulative_reward = 0
+        self.realized_reward = 0.0
+        self.inventory_reward = 0.0
+        self.terminal_reward = 0.0
+        self.last_reward_components = {
+            'realized': 0.0,
+            'inventory': 0.0,
+            'terminal': 0.0,
+            'total': 0.0,
+        }
         self.reference_bid_price = None
         self.market_buys = 0 
         self.market_sells = 0
         self.limit_buys = 0
         self.limit_sells = 0
+
+    def register_reward_components(self, realized=0.0, inventory=0.0, terminal=0.0):
+        """Track explicit reward decomposition for diagnostics and analysis."""
+        realized = float(realized)
+        inventory = float(inventory)
+        terminal = float(terminal)
+        self.realized_reward += realized
+        self.inventory_reward += inventory
+        self.terminal_reward += terminal
+        total = realized + inventory + terminal
+        self.last_reward_components = {
+            'realized': realized,
+            'inventory': inventory,
+            'terminal': terminal,
+            'total': total,
+        }
+        return total
 
     def get_reward(self, cash, volume):        
         assert self.reference_bid_price is not None, 'reference bid price is not set'
@@ -896,7 +922,7 @@ class RLAgent(ExecutionAgent):
         methods:
             - ... 
     """
-    def __init__(self, action_book_levels, observation_book_levels, volume, terminal_time, start_time, time_delta, priority, initial_shape_file=None, drop_feature=None, inventory_max=None) -> None:
+    def __init__(self, action_book_levels, observation_book_levels, volume, terminal_time, start_time, time_delta, priority, initial_shape_file=None, drop_feature=None, inventory_max=None, use_ofi=False) -> None:
         """
         args:
             - action_book_levels: for example if this is = 2, post on the first two levels of the order book, action space is then [m,l1,l2,inactive]
@@ -913,6 +939,7 @@ class RLAgent(ExecutionAgent):
         else:
             pass
         self.drop_feature = drop_feature
+        self.use_ofi = bool(use_ofi)
 
         assert action_book_levels >= 1, 'action book levels must be at least 1'
         super().__init__(volume, 'rl_agent', priority)
@@ -933,40 +960,14 @@ class RLAgent(ExecutionAgent):
         self.last_bid_vol = 0
         self.last_ask_vol = 0
 
-        # observation space length depends on features and queue positions, see the code below
-        # note: adding queue positions did not improve the result in the flow 40 case
-        # currently no better idea than setting this manually
-        # self.observation_space_length = 176
-        # self.observation_space_length = 146 # shape with new queue position encoding
-        # 6: time, volume, bid_price_drift, mid_price_drift, spread, imbalance
-        # 3: mo_imbalance lo_imbalac, price_dift_delta // where does 4 come from ?
-        # 7: order_distribution: 5 observation levels, and one overflow level, one level for no orders placed.
-        # bid and ask volumes: 5 + 5
-        # levels and queue positions: 2*60
-        # added cancellation imbalance features
-        # BILATERAL MM: +2 inventory features
-        self.observation_space_length = 6+4+6+5+5+2*int(volume)+1 + 2
-        # adjusting observation space length if we drop features
-        if self.drop_feature == 'volume':
-            # 5 order book levels on each side + imbalance feature
-            self.observation_space_length = self.observation_space_length - 10 - 1
-        elif self.drop_feature == 'order_info':
-            # drop: level and queue position information
-            # drop: order distribution information: 5 levels + overflow + no order placed
-            self.observation_space_length = self.observation_space_length - 2*int(volume) - observation_book_levels - 2
-        elif self.drop_feature == 'drift':
-            # droping mo_imbalance, lo_imbalance, price_drift_delta
-            # still keep bid_price_drift and mid_price_drift
-            self.observation_space_length -= 3
-            # new: also drop mid_price_drift and bid_price_drift
-            self.observation_space_length -= 2
-            # cancellation imbalance
-            self.observation_space_length -= 1
+        self.action_book_levels = action_book_levels
+        self.observation_book_levels = observation_book_levels
+
+        # Dynamic, configuration-aware derivation of observation size.
+        self.observation_space_length = self._compute_observation_space_length()
         # final shape is 6+4+6+5+5+60+60 with observable levels = 5
         # market, l1, l2, inactive
         self.action_space_length = action_book_levels + 2
-        self.action_book_levels = action_book_levels
-        self.observation_book_levels = observation_book_levels
         self.start_at_best_price = True
 
         if initial_shape_file is not None:
@@ -974,6 +975,40 @@ class RLAgent(ExecutionAgent):
         else:
             # some normalization constant
             self.initial_shape = 20
+
+    def _compute_observation_space_length(self):
+        """Derive observation size from active feature blocks (no hardcoded level constants)."""
+        length = 0
+
+        # Base block
+        # drift dropped => [time, volume, spread], else add bid/mid drifts.
+        if self.drop_feature == 'drift':
+            length += 3
+        else:
+            length += 5
+
+        # Market/volume block
+        # [imbalance] + bid vols + ask vols
+        if self.drop_feature != 'volume':
+            length += 1 + 2 * int(self.observation_book_levels)
+            if self.use_ofi:
+                length += 1
+
+        # Order info block
+        # order distribution (n_levels + overflow + inactive) + levels + queues
+        if self.drop_feature != 'order_info':
+            length += int(self.observation_book_levels) + 2
+            length += 2 * int(self.initial_volume)
+
+        # Drift/microstructure block
+        if self.drop_feature != 'drift':
+            # market imbalance, limit imbalance, cancellation imbalance, delta mid drift
+            length += 4
+
+        # Inventory block
+        length += 2
+
+        return int(length)
         
     def generate_order(self, lob, time, action):
         """
@@ -1411,6 +1446,7 @@ class RLAgent(ExecutionAgent):
         delta_vb = get_delta_v(curr_bid_p, curr_bid_v, self.last_bid_price, self.last_bid_vol, True)
         delta_va = get_delta_v(curr_ask_p, curr_ask_v, self.last_ask_price, self.last_ask_vol, False)
         ofi = (delta_vb - delta_va) / (max(curr_bid_v + curr_ask_v, 1)) # Normalize by total top-of-book volume
+        ofi_feature = np.array([ofi], dtype=np.float32)
         
         # Update trackers
         self.last_bid_price, self.last_ask_price = curr_bid_p, curr_ask_p
@@ -1434,6 +1470,8 @@ class RLAgent(ExecutionAgent):
             pass
         else:            
             observation = np.concatenate([observation, [imbalance], bid_volumes, ask_volumes], dtype=np.float32)
+            if self.use_ofi:
+                observation = np.concatenate([observation, ofi_feature], dtype=np.float32)
 
         # order_info features 
         if self.drop_feature == 'order_info':
@@ -1456,6 +1494,12 @@ class RLAgent(ExecutionAgent):
         # FINAL CLEANING: Remove NaNs and clip to prevent explosive values
         observation = np.nan_to_num(observation, nan=0.0, posinf=100.0, neginf=-100.0)
         observation = np.clip(observation, -100.0, 100.0)
+
+        if observation.shape[0] != self.observation_space_length:
+            raise ValueError(
+                f"Observation length mismatch: declared={self.observation_space_length}, actual={observation.shape[0]}, "
+                f"drop_feature={self.drop_feature}, obs_levels={self.observation_book_levels}, volume={self.initial_volume}, use_ofi={self.use_ofi}"
+            )
 
         return observation
     

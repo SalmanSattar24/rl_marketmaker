@@ -72,7 +72,8 @@ print("-" * 70)
 
 try:
     # Create batch of observations
-    obs_batch = torch.tensor([obs] * 4, dtype=torch.float32)
+    obs_batch_np = np.stack([obs] * 4, axis=0)
+    obs_batch = torch.as_tensor(obs_batch_np, dtype=torch.float32)
 
     # Sample bilateral actions
     actions, log_prob, entropy, value = bilateral_agent.get_action_and_value(obs_batch)
@@ -122,7 +123,8 @@ print("-" * 70)
 
 try:
     # Create new observation batch
-    obs_batch = torch.tensor([obs] * 2, dtype=torch.float32)
+    obs_batch_np = np.stack([obs] * 2, axis=0)
+    obs_batch = torch.as_tensor(obs_batch_np, dtype=torch.float32)
 
     # Sample actions
     actions, log_prob, entropy, value = bilateral_agent.get_action_and_value(obs_batch)
@@ -159,7 +161,8 @@ print("-" * 70)
 
 try:
     # Create batch of observations and sample actions
-    obs_batch = torch.tensor([obs] * 4, dtype=torch.float32)
+    obs_batch_np = np.stack([obs] * 4, axis=0)
+    obs_batch = torch.as_tensor(obs_batch_np, dtype=torch.float32)
 
     with torch.no_grad():
         actions, log_prob_1, entropy_1, value_1 = bilateral_agent.get_action_and_value(obs_batch)
@@ -265,7 +268,8 @@ try:
     optimizer = optim.Adam(bilateral_agent.parameters(), lr=1e-4)
 
     # Mini training loop (1 step)
-    obs_batch = torch.tensor([obs] * 8, dtype=torch.float32)
+    obs_batch_np = np.stack([obs] * 8, axis=0)
+    obs_batch = torch.as_tensor(obs_batch_np, dtype=torch.float32)
 
     # Sample actions
     with torch.no_grad():
@@ -304,7 +308,8 @@ try:
     print(f"      - Total loss: {total_loss.item():.6f}")
 
     # Verify parameters changed
-    obs_batch_2 = torch.tensor([obs] * 8, dtype=torch.float32)
+    obs_batch_2_np = np.stack([obs] * 8, axis=0)
+    obs_batch_2 = torch.as_tensor(obs_batch_2_np, dtype=torch.float32)
     with torch.no_grad():
         _, log_probs_after, _, _ = bilateral_agent.get_action_and_value(obs_batch_2)
 
@@ -326,7 +331,8 @@ print("-" * 70)
 try:
     # Reset environment
     obs, _ = market.reset(seed=42)
-    obs_batch = torch.tensor([obs] * 2, dtype=torch.float32)
+    obs_batch_np = np.stack([obs] * 2, axis=0)
+    obs_batch = torch.as_tensor(obs_batch_np, dtype=torch.float32)
 
     # Get deterministic actions
     det_actions = bilateral_agent.deterministic_action(obs_batch)
