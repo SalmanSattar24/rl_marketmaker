@@ -12,6 +12,7 @@ from .limit_order_book import (
     LimitOrder,
     MarketOrder,
     Cancellation,
+    Modification,
     CancellationByPriceVolume,
     LimitOrderBook,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "LimitOrder",
     "MarketOrder",
     "Cancellation",
+    "Modification",
     "CancellationByPriceVolume",
     "LimitOrderBook",
 ]

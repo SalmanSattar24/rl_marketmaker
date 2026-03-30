@@ -1,7 +1,8 @@
 torch
-gym
+gymnasium
 numpy
 matplotlib
+seaborn
 pandas
 tensorboard
 tyro
