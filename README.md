@@ -162,6 +162,20 @@ See `TECHNICAL_IMPROVEMENTS.md` for details. The highest-leverage next work is:
 
 ---
 
+## Acknowledgments and attribution
+
+This project builds on prior academic and open-source work.
+
+- **Research foundation**: The design direction, terminology, and several experimental choices in this repository are informed by the trade-execution literature, including the paper referenced during this project hardening cycle:
+   - Cheridito & Weiss (2026), *Reinforcement Learning for Trade Execution with Market and Limit Orders* (arXiv:2507.06345).
+
+- **Base repository**: This codebase was developed using `moritzweiss/rlte` as an initial base/reference:
+   - https://github.com/moritzweiss/rlte
+
+Where behavior diverges from the upstream/base implementation, this repository documents changes in `RELEASE_NOTES.md` and related test updates.
+
+---
+
 ## Notes
 
 - Active branch: `master`
