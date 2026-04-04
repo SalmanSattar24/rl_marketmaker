@@ -602,7 +602,15 @@ class ExecutionAgent():
         self.initial_volume = volume
         self.agent_id = agent_id
         self.priority = priority
+        # Maker-taker fees (0 by default, set via set_fees)
+        self.maker_rebate = 0.0
+        self.taker_fee = 0.0
         self.reset()
+
+    def set_fees(self, maker_rebate, taker_fee):
+        """Set maker-taker fee structure. Called by Market environment."""
+        self.maker_rebate = float(maker_rebate)
+        self.taker_fee = float(taker_fee)
     
     def reset(self):
         self.volume = self.initial_volume
@@ -618,10 +626,13 @@ class ExecutionAgent():
             'total': 0.0,
         }
         self.reference_bid_price = None
-        self.market_buys = 0 
+        self.market_buys = 0
         self.market_sells = 0
         self.limit_buys = 0
         self.limit_sells = 0
+        # Maker-taker fee tracking (set by Market environment via set_fees)
+        self.cumulative_fees_paid = 0.0
+        self.cumulative_rebates_earned = 0.0
 
     def register_reward_components(self, realized=0.0, inventory=0.0, terminal=0.0):
         """Track explicit reward decomposition for diagnostics and analysis."""
@@ -646,23 +657,20 @@ class ExecutionAgent():
     
     def update_position_from_message_list(self, message_list):
         rewards = [self.update_position(m) for m in message_list]
-        assert self.volume >= 0
+        # Bilateral MM: volume can go negative (short), so no assert >= 0
         # Episode terminates when inventory is completely liquidated (volume == 0)
+        # For bilateral MM agents (RLAgent), termination is time-based, not volume-based
         terminated = self.volume == 0
         return sum(rewards), terminated
 
     def update_position(self, fill_message):
         reward = 0
         assert self.active_volume >= 0, f"active_volume {self.active_volume} < 0"
-        assert self.volume >= 0, f"volume {self.volume} < 0"
+        # Bilateral MM: volume can go negative (short position), so only assert bookkeeping counters
         assert self.limit_buys >= 0, f"limit_buys {self.limit_buys} < 0"
         assert self.limit_sells >= 0, f"limit_sells {self.limit_sells} < 0"
         assert self.market_buys >= 0, f"market_buys {self.market_buys} < 0"
         assert self.market_sells >= 0, f"market_sells {self.market_sells} < 0"
-        assert self.active_volume <= self.volume, f"active_volume {self.active_volume} > volume {self.volume}"
-        # Bilateral MM: Relax order tracking assertions - agent can place many orders that get filled
-        # The key constraint is that remaining volume to execute (self.volume) must be >= 0
-        # Order tracking (market_buys, limit_buys, etc.) is for bookkeeping only
         if fill_message.type == 'modification':
             # this agent doesnt modify orders
             print('MODIFICATION but we do not update the position!')
@@ -685,18 +693,26 @@ class ExecutionAgent():
             # BILATERAL MM: Both buy and sell orders now allowed (removed one-sided assertions)
             side = fill_message.order.side
             if fill_message.order.agent_id == self.agent_id:
+                filled_vol = int(fill_message.filled_volume)
+                # Taker fee: agent is the aggressor (market order sender)
+                taker_fee_cost = self.taker_fee * filled_vol / self.initial_volume
                 # ask means buy --> volume increases, negative cash flow
                 if side == 'ask':
-                    self.volume += int(fill_message.filled_volume)
-                    self.market_buys += int(fill_message.filled_volume)
-                    reward -= self.get_reward(fill_message.execution_price, fill_message.filled_volume)
-                    self.cummulative_reward -= reward
+                    self.volume += filled_vol
+                    self.market_buys += filled_vol
+                    pnl = self.get_reward(fill_message.execution_price, fill_message.filled_volume)
+                    reward -= pnl
+                    reward -= taker_fee_cost
+                    self.cummulative_reward -= pnl + taker_fee_cost
                 # bid means sell --> volume decreases, positive cash flow
                 elif side == 'bid':
-                    self.volume -= int(fill_message.filled_volume)
-                    self.market_sells += int(fill_message.filled_volume)
-                    reward += self.get_reward(fill_message.execution_price, fill_message.filled_volume)
-                    self.cummulative_reward += reward
+                    self.volume -= filled_vol
+                    self.market_sells += filled_vol
+                    pnl = self.get_reward(fill_message.execution_price, fill_message.filled_volume)
+                    reward += pnl
+                    reward -= taker_fee_cost
+                    self.cummulative_reward += pnl - taker_fee_cost
+                self.cumulative_fees_paid += taker_fee_cost
             # check for passive limit order fills
             # BILATERAL MM: Both buy and sell passive fills allowed (removed one-sided assertion)
             if self.agent_id in fill_message.passive_fills:
@@ -705,20 +721,27 @@ class ExecutionAgent():
                 for m in fill_message.passive_fills[self.agent_id]:
                     volume += int(m.filled_volume)
                     cash += int(m.filled_volume) * m.order.price
+                # Maker rebate: agent is the passive party (limit order resting)
+                maker_rebate_reward = self.maker_rebate * volume / self.initial_volume
                 # market side is ask, market buy --> limit sell
                 if side == 'ask':
                     self.active_volume -= volume
                     self.volume -= volume
                     self.limit_sells += volume
-                    reward += self.get_reward(cash, volume)
-                    self.cummulative_reward += reward
+                    pnl = self.get_reward(cash, volume)
+                    reward += pnl
+                    reward += maker_rebate_reward
+                    self.cummulative_reward += pnl + maker_rebate_reward
                 # market side is bid, market sell --> limit buy
                 elif side == 'bid':
                     self.active_volume -= volume
                     self.volume += volume
                     self.limit_buys += volume
-                    reward -= self.get_reward(cash, volume)
-                    self.cummulative_reward -= reward
+                    pnl = self.get_reward(cash, volume)
+                    reward -= pnl
+                    reward += maker_rebate_reward
+                    self.cummulative_reward -= pnl - maker_rebate_reward
+                self.cumulative_rebates_earned += maker_rebate_reward
             return reward
         else: 
             raise ValueError(f'Unknown message type {fill_message.type}')
@@ -1147,103 +1170,119 @@ class RLAgent(ExecutionAgent):
 
     def _generate_bilateral_orders(self, lob, time, bid_action, ask_action):
         """
-        Generate bilateral (buy and sell) orders simultaneously.
-        Phase 3+: Full bilateral market-making implementation.
+        Generate bilateral (buy and sell) orders with incremental updates.
 
-        Args:
-            lob: Limit order book state
-            time: Current time
-            bid_action: Simplex-normalized bid side action (purchase allocation)
-            ask_action: Simplex-normalized ask side action (sale allocation)
+        Action layout (each side): [market, L0, L1, ..., L(K-1), inactive]
+          - L0 = best price (best_bid for buy, best_ask for sell)
+          - L1 = best_bid-1 for buy, best_ask+1 for sell
+          - ...
 
-        Returns:
-            order_list: List of orders (bid and ask side)
-
-        Generates market and limit orders on both sides:
-            - Bid side: Market buys + limit buys below best bid
-            - Ask side: Market sells + limit sells above best ask
+        Incremental logic: only cancel orders that differ from target,
+        preserving queue position for unchanged levels.
         """
         if time >= self.start_time and time < self.terminal_time:
-            # Robustly normalize both sides for compatibility with raw policy/test actions
             bid_action = self._normalize_action_simplex(bid_action)
             ask_action = self._normalize_action_simplex(ask_action)
 
             best_bid = lob.get_best_price('bid')
             best_ask = lob.get_best_price('ask')
 
-            # Get current position on each side
-            volume_per_level, orders_within_range = self.get_order_allocation(lob, self.action_book_levels)
-            volume_per_level.insert(0, 0)  # Add market level marker
+            # Get current bilateral allocation (what we already have in the book)
+            curr_bid_vols, bid_orders_in_range, curr_ask_vols, ask_orders_in_range = \
+                self.get_bilateral_order_allocation(lob, self.action_book_levels)
 
-            # Split volume: use proportional allocation based on action magnitudes
-            # Heuristic: if ask_action is stronger (higher market %), sell more; if bid_action stronger, buy more
-            ask_market_pct = ask_action[0]
-            bid_market_pct = bid_action[0]
-            total_market_strength = ask_market_pct + bid_market_pct + 1e-6  # Avoid division by zero
+            # Volume budget: split available volume between bid and ask
+            # Available = what's not currently resting in the book
+            bid_active = sum(curr_bid_vols)
+            ask_active = sum(curr_ask_vols)
+            total_active = bid_active + ask_active
 
-            # Allocate volume: can buy up to 50% of volume (inventory limit), sell up to 50%
-            max_buy_volume = min(int(self.volume / 2), self.volume - self.active_volume)
-            max_sell_volume = min(int(self.volume / 2), self.volume - self.active_volume)
+            # Each side can use up to half of initial_volume (symmetric capacity)
+            max_per_side = max(1, self.initial_volume // 2)
 
-            # Scale by market strength (if both high, reduce both)
-            buy_volume_target = int(max_buy_volume * bid_market_pct / total_market_strength)
-            sell_volume_target = int(max_sell_volume * ask_market_pct / total_market_strength)
+            # Compute target volumes per level
+            # bid_action = [market%, L0%, L1%, ..., L(K-1)%, inactive%]
+            buy_budget = max(0, max_per_side - bid_active + int(curr_bid_vols[-1]))  # can replace overflow
+            sell_budget = max(0, max_per_side - ask_active + int(curr_ask_vols[-1]))
 
             order_list = []
 
             # ========== BID SIDE (BUYING) ==========
-            bid_target_volumes = []
-            available_bid_volume = buy_volume_target
+            # Target: how many lots on each level
+            bid_target = []
+            remaining = buy_budget
             for l in range(len(bid_action)):
-                # Use floor to avoid over-allocation, then add leftovers at the end
-                volume_on_level = int(bid_action[l] * buy_volume_target)
-                volume_on_level = min(volume_on_level, available_bid_volume)
-                available_bid_volume -= volume_on_level
-                bid_target_volumes.append(volume_on_level)
-            bid_target_volumes[-1] += available_bid_volume  # Add leftovers to inactive
+                vol = min(int(bid_action[l] * buy_budget), remaining)
+                bid_target.append(vol)
+                remaining -= vol
+            bid_target[-1] += remaining  # leftovers to inactive
 
-            # Cancel existing bid orders outside range
-            bid_orders_to_cancel = lob.order_map_by_agent.get(self.agent_id, set()).copy()
-            for order_id in bid_orders_to_cancel:
-                order = lob.order_map[order_id]
-                if order.side == 'ask':  # Buying means we place 'ask' orders in our record (inverted logic in LOB)
-                    order_list.append(Cancellation(self.agent_id, order_id, time))
+            # Cancel out-of-range bid orders (overflow bucket)
+            for order_id in list(lob.order_map_by_agent.get(self.agent_id, set())):
+                if order_id in lob.order_map and lob.order_map[order_id].side == 'bid':
+                    if order_id not in bid_orders_in_range or order_id in bid_orders_in_range:
+                        # Check if this order is in the overflow set (not in the level range)
+                        pass
+            # Cancel bid orders outside the action_book_levels range
+            for order_id in list(lob.order_map_by_agent.get(self.agent_id, set())):
+                if order_id not in bid_orders_in_range and order_id in lob.order_map and lob.order_map[order_id].side == 'bid':
+                    order_list.insert(0, Cancellation(self.agent_id, order_id, time))
 
-            # Place bid side orders
-            for level in range(1, len(bid_action)):  # Skip market level (level 0)
-                if bid_target_volumes[level] > 0:
-                    # Bid side: limit buy orders at bid_price - level
-                    limit_price = best_bid - level
-                    if limit_price > 0:
-                        order_list.append(LimitOrder(self.agent_id, 'bid', limit_price, bid_target_volumes[level], time))
+            # Incremental update for each bid level: cancel diff or place diff
+            for level in range(self.action_book_levels):
+                target_vol = bid_target[level + 1]  # +1 because index 0 is market
+                current_vol = curr_bid_vols[level]   # current volume on this level
+                price = best_bid - level              # L0=best_bid, L1=best_bid-1, ...
 
-            # Place market bid orders if specified
-            if bid_target_volumes[0] > 0:
-                order = MarketOrder(self.agent_id, 'ask', bid_target_volumes[0], time)
-                order_list.append(order)
+                if np.isnan(price) or price <= 0:
+                    continue
+
+                diff = target_vol - current_vol
+                if diff > 0:
+                    # Need more volume: place new limit order
+                    order_list.append(LimitOrder(self.agent_id, 'bid', int(price), diff, time))
+                elif diff < 0:
+                    # Need less volume: cancel excess via CancellationByPriceVolume
+                    order_list.insert(0, CancellationByPriceVolume(
+                        agent_id=self.agent_id, side='bid', price=int(price), volume=-diff, time=time))
+
+            # Market buy orders (aggressive)
+            if bid_target[0] > 0:
+                order_list.append(MarketOrder(self.agent_id, 'ask', bid_target[0], time))
 
             # ========== ASK SIDE (SELLING) ==========
-            ask_target_volumes = []
-            available_ask_volume = sell_volume_target
+            ask_target = []
+            remaining = sell_budget
             for l in range(len(ask_action)):
-                # Use floor to avoid over-allocation, then add leftovers at the end
-                volume_on_level = int(ask_action[l] * sell_volume_target)
-                volume_on_level = min(volume_on_level, available_ask_volume)
-                available_ask_volume -= volume_on_level
-                ask_target_volumes.append(volume_on_level)
-            ask_target_volumes[-1] += available_ask_volume  # Add leftovers to inactive
+                vol = min(int(ask_action[l] * sell_budget), remaining)
+                ask_target.append(vol)
+                remaining -= vol
+            ask_target[-1] += remaining
 
-            # Place ask side orders
-            for level in range(1, len(ask_action)):  # Skip market level (level 0)
-                if ask_target_volumes[level] > 0:
-                    # Ask side: limit sell orders at ask_price + level
-                    limit_price = best_ask + level
-                    order_list.append(LimitOrder(self.agent_id, 'ask', limit_price, ask_target_volumes[level], time))
+            # Cancel ask orders outside range
+            for order_id in list(lob.order_map_by_agent.get(self.agent_id, set())):
+                if order_id not in ask_orders_in_range and order_id in lob.order_map and lob.order_map[order_id].side == 'ask':
+                    order_list.insert(0, Cancellation(self.agent_id, order_id, time))
 
-            # Place market ask orders if specified
-            if ask_target_volumes[0] > 0:
-                order = MarketOrder(self.agent_id, 'bid', ask_target_volumes[0], time)
-                order_list.append(order)
+            # Incremental update for each ask level
+            for level in range(self.action_book_levels):
+                target_vol = ask_target[level + 1]
+                current_vol = curr_ask_vols[level]
+                price = best_ask + level              # L0=best_ask, L1=best_ask+1, ...
+
+                if np.isnan(price) or price <= 0:
+                    continue
+
+                diff = target_vol - current_vol
+                if diff > 0:
+                    order_list.append(LimitOrder(self.agent_id, 'ask', int(price), diff, time))
+                elif diff < 0:
+                    order_list.insert(0, CancellationByPriceVolume(
+                        agent_id=self.agent_id, side='ask', price=int(price), volume=-diff, time=time))
+
+            # Market sell orders (aggressive)
+            if ask_target[0] > 0:
+                order_list.append(MarketOrder(self.agent_id, 'bid', ask_target[0], time))
 
             return order_list
 
@@ -1276,10 +1315,11 @@ class RLAgent(ExecutionAgent):
         mid_price = (best_bid + best_ask)/2
         bid_price_drift = (best_bid - self.reference_bid_price)/10
         mid_price_drift = (mid_price - self.reference_mid_price)/10
-        spread = (best_ask - best_bid)/10        
-        
-        # Stability: Ensure spread as index is valid
-        safe_spread_idx = max(0, int(np.nan_to_num(spread) - 1))
+        raw_spread = best_ask - best_bid  # in ticks (integer)
+        spread = raw_spread / 10  # normalized for observation feature
+
+        # Spread index in ticks (NOT the /10 normalized value)
+        safe_spread_idx = max(0, int(np.nan_to_num(raw_spread) - 1))
 
         # volumes and imbalance 
         if self.start_at_best_price:
@@ -1288,32 +1328,38 @@ class RLAgent(ExecutionAgent):
         else:
             bid_volumes = lob.data.bid_volumes[-1][safe_spread_idx:self.observation_book_levels+safe_spread_idx]
             ask_volumes = lob.data.ask_volumes[-1][safe_spread_idx:self.observation_book_levels+safe_spread_idx]
-        if np.sum(bid_volumes+ask_volumes) <= 1e-8:
-            # print('first 5 bid+ask volumes are zero')
-            # print(f'all bid vols: {lob.data.bid_volumes[-1]}')
-            # print(f'all ask vols: {lob.data.ask_volumes[-1]}')
+        # Replace NaN volumes (empty LOB side) with 0 before computing imbalance
+        bid_volumes = np.nan_to_num(bid_volumes, nan=0.0)
+        ask_volumes = np.nan_to_num(ask_volumes, nan=0.0)
+        total_vol = np.sum(bid_volumes + ask_volumes)
+        if total_vol <= 1e-8:
             imbalance = 0
         else:
-            imbalance = np.sum(bid_volumes - ask_volumes) / (np.sum(bid_volumes + ask_volumes) + 1e-8)
+            imbalance = np.sum(bid_volumes - ask_volumes) / (total_vol + 1e-8)
             
-        # normalize volumes through initial shape files 
-        if self.start_at_best_price:
-            bid_volumes = bid_volumes / (self.initial_shape[safe_spread_idx:self.observation_book_levels+safe_spread_idx] + 1e-8)
-            ask_volumes = ask_volumes / (self.initial_shape[safe_spread_idx:self.observation_book_levels+safe_spread_idx] + 1e-8)
+        # normalize volumes through initial shape files
+        # Ensure initial_shape is an array (scalar fallback for missing shape files)
+        if np.isscalar(self.initial_shape):
+            shape_arr = np.full(self.observation_book_levels, float(self.initial_shape))
+        elif self.start_at_best_price:
+            # Volumes are from best price: [:obs_levels], normalize by same range from shape
+            shape_arr = self.initial_shape[:self.observation_book_levels]
         else:
-            bid_volumes = bid_volumes / (self.initial_shape[:self.observation_book_levels] + 1e-8)
-            ask_volumes = ask_volumes / (self.initial_shape[:self.observation_book_levels] + 1e-8)
+            # Volumes offset by spread: [spread_idx:spread_idx+obs_levels]
+            shape_arr = self.initial_shape[safe_spread_idx:self.observation_book_levels+safe_spread_idx]
+        # Pad if shape is shorter than observation_book_levels
+        if len(shape_arr) < self.observation_book_levels:
+            shape_arr = np.pad(shape_arr, (0, self.observation_book_levels - len(shape_arr)), constant_values=1.0)
+        bid_volumes = bid_volumes / (shape_arr + 1e-8)
+        ask_volumes = ask_volumes / (shape_arr + 1e-8)
 
         # order distribution: orders on p1,p2,...,p(observation_book_levels), orders outside the range
         volume_per_level, _ = self.get_order_allocation(lob, self.observation_book_levels, start_at_best_price=self.start_at_best_price)
-        # append inactive volume
-        volume_per_level.append(self.volume-self.active_volume)
-        order_dist = np.array(volume_per_level)
-        assert np.sum(order_dist) == self.volume        
-        if self.volume == 0:
-            order_dist = np.array(order_dist, dtype=np.float32)
-        else:
-            order_dist = np.array(order_dist, dtype=np.float32)/self.volume
+        # append inactive volume (can be negative in bilateral when volume < active_volume)
+        volume_per_level.append(self.volume - self.active_volume)
+        order_dist = np.array(volume_per_level, dtype=np.float32)
+        # Normalize by initial_volume (stable denominator) instead of current volume
+        order_dist = order_dist / (self.initial_volume + 1e-8)
         
         # old one hot queue position encoding 
         # record queue position for the first two levels  
@@ -1334,69 +1380,63 @@ class RLAgent(ExecutionAgent):
         #         pass        
         # queue_positions = queue_positions.flatten()
 
-        # new queue position encoding
-        # BILATERAL MM: Simplified approach - just ensure correct final size
+        # Order level and queue position encoding
         levels = []
         queues = []
         volume_seen = 0
+        max_queue_size = 40
 
         # Get all orders for this agent currently in the LOB
         if self.agent_id in lob.order_map_by_agent:
             agent_orders = lob.order_map_by_agent[self.agent_id]
             for order_id in agent_orders:
+                if order_id not in lob.order_map:
+                    continue
                 order = lob.order_map[order_id]
-                vol = max(0, round(order.volume))  # Ensure non-negative
-                if vol > 0 and volume_seen < int(self.volume):  # Don't exceed current volume
-                    vol_to_add = min(vol, int(self.volume) - volume_seen)  # Cap at remaining
+                vol = max(0, round(order.volume))
+                if vol > 0 and volume_seen < int(self.initial_volume):
+                    vol_to_add = min(vol, int(self.initial_volume) - volume_seen)
 
                     if order.side == 'ask':
                         level = order.price - best_ask
-                        if 1 <= level <= self.observation_book_levels:
+                        if 0 <= level <= self.observation_book_levels:
                             levels.extend([level] * vol_to_add)
                         else:
                             levels.extend([self.observation_book_levels+1] * vol_to_add)
                     else:  # bid
                         level = best_bid - order.price
-                        if 1 <= level <= self.observation_book_levels:
+                        if 0 <= level <= self.observation_book_levels:
                             levels.extend([-level] * vol_to_add)
                         else:
                             levels.extend([self.observation_book_levels+1] * vol_to_add)
 
-                    queues.extend([0] * vol_to_add)
+                    # Compute actual queue position: volume ahead of us at this price
+                    queue_pos = 0
+                    price = order.price
+                    side = order.side
+                    if price in lob.price_map[side]:
+                        for oid in lob.price_map[side][price]:
+                            if oid == order_id:
+                                break
+                            queue_pos += lob.order_map[oid].volume
+                    # Normalize: fraction of queue ahead (0=front, 1=back)
+                    queue_frac = min(queue_pos / max_queue_size, 1.0)
+                    queues.extend([queue_frac] * vol_to_add)
                     volume_seen += vol_to_add
 
-        max_queue_size = 40
-
-        # Fill remaining with inactive volume
-        while len(levels) < int(self.volume):
-            levels.append(self.observation_book_levels + 1)
+        # Pad to initial_volume (fixed size for neural network input)
+        target_len = int(self.initial_volume)
+        while len(levels) < target_len:
+            levels.append(self.observation_book_levels + 1)  # inactive/no order marker
             queues.append(0)
 
-        # Add filled volume
-        filled_volume = self.initial_volume - self.volume
-        for _ in range(int(filled_volume)):
-            levels.append(-self.observation_book_levels)
-            queues.append(0)
+        # Clamp to exact size
+        levels = levels[:target_len]
+        queues = queues[:target_len]
 
-        # Ensure exact size (clamp to required)
-        levels = levels[:int(self.initial_volume)]
-        queues = queues[:int(self.initial_volume)]
-
-        # Pad if needed
-        while len(levels) < int(self.initial_volume):
-            levels.append(-self.observation_book_levels)
-            queues.append(0)
-
-        # TEMPORARY: Relax assertions to allow debugging later
-        # Just clamp to exact size if there's a mismatch
-        if len(queues) != int(self.initial_volume):
-            queues = queues[:int(self.initial_volume)] + [0] * max(0, int(self.initial_volume) - len(queues))
-        if len(levels) != int(self.initial_volume):
-            levels = levels[:int(self.initial_volume)] + [-self.observation_book_levels] * max(0, int(self.initial_volume) - len(levels))
-
-        # normalization 
-        queues = np.array(queues, dtype=np.float32)/max_queue_size
-        levels = np.array(levels, dtype=np.float32)/(self.observation_book_levels+1)
+        # Normalize levels (queues already normalized to [0,1] above)
+        queues = np.array(queues, dtype=np.float32)
+        levels = np.array(levels, dtype=np.float32) / (self.observation_book_levels + 1)
         
         # market order imbalance 
         buys = [x for x, t in zip(lob.data.market_buy, lob.data.time_stamps) if t >= time-self.time_delta and t <= time]  
@@ -1453,7 +1493,9 @@ class RLAgent(ExecutionAgent):
         self.last_bid_vol, self.last_ask_vol = curr_bid_v, curr_ask_v
 
         # Inventory features (bounded for stability and contract consistency)
-        norm_inventory = net_inventory / (self.inventory_max + 1e-8)
+        # Use initial_volume as normalizer when inventory_max is infinite
+        inv_normalizer = self.inventory_max if np.isfinite(self.inventory_max) else float(self.initial_volume)
+        norm_inventory = net_inventory / (inv_normalizer + 1e-8)
         norm_inventory = float(np.clip(norm_inventory, -1.0, 1.0))
         time_weighted_inventory = float(np.clip(time_weighted_inventory, 0.0, 1.0))
         inventory_features = np.array([norm_inventory, time_weighted_inventory], dtype=np.float32)
@@ -1542,8 +1584,64 @@ class RLAgent(ExecutionAgent):
         volume_per_level.append(self.active_volume-sum(volume_per_level))
         assert sum(volume_per_level) <= self.volume
         assert sum(volume_per_level) == self.active_volume
-        assert sum([v < 0 for v in volume_per_level]) == 0 
+        assert sum([v < 0 for v in volume_per_level]) == 0
         return volume_per_level, orders_within_range
+
+    def get_bilateral_order_allocation(self, lob, n_levels):
+        """
+        Return order allocation on BOTH sides for bilateral market-making.
+
+        Returns:
+            bid_volumes: [v_best_bid, v_best_bid-1, ..., v_deeper]  (n_levels + 1)
+            bid_orders:  set of order_ids on bid side within range
+            ask_volumes: [v_best_ask, v_best_ask+1, ..., v_deeper]  (n_levels + 1)
+            ask_orders:  set of order_ids on ask side within range
+        """
+        best_bid = lob.get_best_price('bid')
+        best_ask = lob.get_best_price('ask')
+
+        bid_volumes = []
+        bid_orders = set()
+        ask_volumes = []
+        ask_orders = set()
+
+        # Scan ask side (our sell orders): best_ask, best_ask+1, ...
+        for level in range(n_levels):
+            price = best_ask + level
+            vol_on_level = 0
+            if not np.isnan(price) and price in lob.price_map['ask']:
+                for order_id in lob.price_map['ask'][price]:
+                    if lob.order_map[order_id].agent_id == self.agent_id:
+                        vol_on_level += lob.order_map[order_id].volume
+                        ask_orders.add(order_id)
+            ask_volumes.append(vol_on_level)
+        # Overflow: ask orders deeper than range
+        ask_overflow = 0
+        for order_id in lob.order_map_by_agent.get(self.agent_id, set()):
+            if order_id not in ask_orders and lob.order_map[order_id].side == 'ask':
+                ask_overflow += lob.order_map[order_id].volume
+                ask_orders.add(order_id)
+        ask_volumes.append(ask_overflow)
+
+        # Scan bid side (our buy orders): best_bid, best_bid-1, ...
+        for level in range(n_levels):
+            price = best_bid - level
+            vol_on_level = 0
+            if not np.isnan(price) and price in lob.price_map['bid']:
+                for order_id in lob.price_map['bid'][price]:
+                    if lob.order_map[order_id].agent_id == self.agent_id:
+                        vol_on_level += lob.order_map[order_id].volume
+                        bid_orders.add(order_id)
+            bid_volumes.append(vol_on_level)
+        # Overflow: bid orders deeper than range
+        bid_overflow = 0
+        for order_id in lob.order_map_by_agent.get(self.agent_id, set()):
+            if order_id not in bid_orders and lob.order_map[order_id].side == 'bid':
+                bid_overflow += lob.order_map[order_id].volume
+                bid_orders.add(order_id)
+        bid_volumes.append(bid_overflow)
+
+        return bid_volumes, bid_orders, ask_volumes, ask_orders
 
     def new_event(self, time, event):
         assert event == self.agent_id

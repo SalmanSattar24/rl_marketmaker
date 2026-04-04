@@ -556,7 +556,11 @@ class LimitOrderBook:
         # remove 
         self.price_map[side][price].remove(id)
         self.order_map.pop(id)
-        self.order_map_by_agent[order.agent_id].remove(id)       
+        self.order_map_by_agent[order.agent_id].remove(id)
+        # BILATERAL MM: Deregister cancelled order from bid/ask tracking
+        if order.agent_id in self.agent_bid_orders:
+            self.agent_bid_orders[order.agent_id].discard(id)
+            self.agent_ask_orders[order.agent_id].discard(id)
         # delete price level if empty
         if not self.price_map[side][price]:
             self.price_map[side].pop(price)

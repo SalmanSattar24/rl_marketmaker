@@ -4,7 +4,7 @@ parent_dir = os.path.dirname(current_path)
 sys.path.append(parent_dir)
 from simulation.agents import NoiseAgent, LinearSubmitLeaveAgent, StrategicAgent, SubmitAndLeaveAgent, MarketAgent, InitialAgent, ObservationAgent, RLAgent
 from limit_order_book import LimitOrderBook, Cancellation, MarketOrder
-from config import noise_agent_config, strategic_agent_config, sl_agent_config, linear_sl_agent_config, market_agent_config, initial_agent_config, observation_agent_config, rl_agent_config
+from config import noise_agent_config, strategic_agent_config, sl_agent_config, linear_sl_agent_config, market_agent_config, initial_agent_config, observation_agent_config, rl_agent_config, fee_config
 import numpy as np
 import pandas as pd
 from queue import PriorityQueue
@@ -65,7 +65,13 @@ class Market(gym.Env):
         self.circuit_breaker_triggered = False
         self.reward_mark_to_mid_weight = float(config.get('reward_mark_to_mid_weight', 0.0))
         self.previous_mid_price = None
-        
+
+        # Maker-taker fee structure
+        self.maker_rebate = float(config.get('maker_rebate', fee_config['maker_rebate']))
+        self.taker_fee = float(config.get('taker_fee', fee_config['taker_fee']))
+        self.cumulative_fees_paid = 0.0
+        self.cumulative_rebates_earned = 0.0
+
         # set up initial agent          
         if config['market_env'] == 'noise':
             # those files need to be generated in advance. 0.65 denotes the damping factor 
@@ -168,6 +174,9 @@ class Market(gym.Env):
         self.agents[agent.agent_id] = agent
         self.execution_agent_id = agent.agent_id
 
+        # Set maker-taker fees on the execution agent
+        agent.set_fees(self.maker_rebate, self.taker_fee)
+
         if config['execution_agent'] == 'rl_agent':
             self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(agent.observation_space_length,), dtype=np.float32)
             self.action_space = gym.spaces.Box(low=-10, high=10, shape=(agent.action_space_length,), dtype=np.float32)    
@@ -203,6 +212,8 @@ class Market(gym.Env):
         self.last_t = 0
         self.circuit_breaker_triggered = False
         self.previous_mid_price = None
+        self.cumulative_fees_paid = 0.0
+        self.cumulative_rebates_earned = 0.0
         # initialize event queue
         self.pq = PriorityQueue()
         # set initial events
@@ -230,9 +241,7 @@ class Market(gym.Env):
     
     def step(self, action=None):
         observation, reward ,terminated, info = self.transition(action)
-        if terminated and not self.circuit_breaker_triggered:
-            assert self.agents[self.execution_agent_id].volume == 0
-        return observation, reward, terminated, False, info 
+        return observation, reward, terminated, False, info
 
     def transition(self, action=None):
         terminated = False
@@ -332,6 +341,9 @@ class Market(gym.Env):
                 'reward_realized_step': float(transition_reward - inventory_reward),
                 'reward_inventory_step': float(inventory_reward),
                 'reward_terminal_step': float(terminal_closeout_reward),
+                'cumulative_fees_paid': float(self.agents[self.execution_agent_id].cumulative_fees_paid),
+                'cumulative_rebates_earned': float(self.agents[self.execution_agent_id].cumulative_rebates_earned),
+                'net_fee_impact': float(self.agents[self.execution_agent_id].cumulative_rebates_earned - self.agents[self.execution_agent_id].cumulative_fees_paid),
                 }
         if self.execution_agent_id == 'rl_agent':
             # if rl agent is present, get an observation from the market 

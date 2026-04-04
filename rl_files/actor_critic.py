@@ -45,48 +45,34 @@ class Args:
     evaluate: bool = True
     """whether to evaluate the model"""
     n_eval_episodes: int = int(1e4)
-    n_eval_episodes: int = 5  # TEST: Quick evaluation (5 episodes)
     """the number of episodes to evaluate the model"""
     run_directory: str = 'runs'
     """directory for saving models"""
-    run_name:  Optional[str] = None 
+    run_name:  Optional[str] = None
     """to be filled at runtime, should be string type"""
 
     # Algorithm specific arguments
     drop_feature: Optional[str] = 'drift'
     '''feature to be dropped from observation, can be "volume", "order_info", "drift", "None" or None'''
     env_type: str = "strategic"
-    # noise, flow, strategic 
-    """the id of the environment"""
+    """the id of the environment: noise, flow, strategic"""
     num_lots: int = 20
-    num_lots: int = 40
     """the number of lots"""
+    maker_rebate: float = 0.2
+    """maker rebate per lot for passive limit fills (0.0 to disable)"""
+    taker_fee: float = 0.3
+    """taker fee per lot for aggressive market orders (0.0 to disable)"""
     terminal_time: int = 150
-    # terminal_time: int = 300
     """the terminal time for the execution agent"""
     time_delta: int = 15
-    # this setting leads to 10 time steps. num of lots should be divisuble by 10
-    """the time delta for the execution agent"""
-    # total_timesteps: int = 200*128*100
-    # total_timesteps = itertaions * n_cpus * n_steps (in each evnironment)
-    # 10 iterations is one full episode 
-    total_timesteps: int = 200*128*100
-    total_timesteps: int = 20  # TEST: 5-min run (2 iterations)
-    # debug
-    # total_timesteps: int = 2*10
-    # total_timesteps: int = 500*128*100
-    """total timesteps of the experiments"""
+    """the time delta for the execution agent (150/15 = 10 steps per episode)"""
+    total_timesteps: int = 200 * 128 * 100
+    """total timesteps of the experiments (iterations * num_envs * num_steps)"""
     learning_rate: float = 5e-4
     """the learning rate of the optimizer"""
-    # num_envs: int = 128
-    num_envs: int = 1  # TEST: Single environment
-    # num_envs: int = 1
-    # num_envs: int = 1
+    num_envs: int = 128
     """the number of parallel game environments"""
-    # num_steps: int = 100
-    num_steps: int = 10
-    # num_steps: int = 10
-    # less value bootstraping --> user more steps per environment
+    num_steps: int = 100
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = False
     """Toggle learning rate annealing for policy and value networks"""
@@ -95,20 +81,24 @@ class Args:
     # do additional test here with gae_lambda = 0.95
     gae_lambda: float = 1.0
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 1
+    num_minibatches: int = 4
     """the number of mini-batches"""
-    update_epochs: int = 1
+    update_epochs: int = 4
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
-    clip_coef: float = 0.5
+    clip_coef: float = 0.2
     """the surrogate clipping coefficient"""
     clip_vloss: bool = False
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.0
+    ent_coef: float = 0.01
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
+    max_grad_norm: float = 0.5
+    """the maximum norm for the gradient clipping"""
+    target_kl: float = None
+    """the target KL divergence threshold"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -278,6 +268,9 @@ class AgentLogisticNormal(nn.Module):
         return False, None
 
     def get_trunk_out(self, x):
+        return self.critic(x)
+
+    def get_value(self, x):
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None, deterministic=False):
@@ -660,7 +653,7 @@ if __name__ == "__main__":
     # device = torch.device("cuda:1" if torch.cuda.is_available() and args.cuda else "cpu")
     num_gpus = torch.cuda.device_count()
     print(f"Number of GPUs available: {num_gpus}")
-    if num_gpus > 0:
+    if num_gpus > 0 and args.cuda:
         # Choose the last GPU
         last_gpu = num_gpus - 1
         device = torch.device(f"cuda:{last_gpu}")
@@ -668,7 +661,7 @@ if __name__ == "__main__":
     else:
         # Fall back to CPU if no GPU is available
         device = torch.device("cpu")
-        print("No GPU available, using CPU.")
+        print("Using CPU.")
 
     # TODO: additional option in config to remove features
     # This will then have an effect on how observations are generated  
@@ -678,14 +671,14 @@ if __name__ == "__main__":
 
     # environment setup
     print(f'dropping feature: {args.drop_feature}') if args.drop_feature is not None else print('not dropping any feature')
-    configs = [{'market_env': args.env_type , 'execution_agent': 'rl_agent', 'volume': args.num_lots, 'seed': args.seed+s, 
-                'terminal_time': args.terminal_time, 'time_delta': args.time_delta, 'drop_feature': args.drop_feature} for s in range(args.num_envs)]
+    base_cfg = {'market_env': args.env_type, 'execution_agent': 'rl_agent', 'volume': args.num_lots,
+                'terminal_time': args.terminal_time, 'time_delta': args.time_delta,
+                'drop_feature': args.drop_feature, 'maker_rebate': args.maker_rebate, 'taker_fee': args.taker_fee}
+    configs = [{**base_cfg, 'seed': args.seed + s} for s in range(args.num_envs)]
     if args.exp_name == 'normal':
-        # if we use just normal distribution, let the environment transform actions from R^n to the simplex 
-        configs = [{'market_env': args.env_type , 'execution_agent': 'rl_agent', 'volume': args.num_lots, 'seed': args.seed+s, 
-                    'terminal_time': args.terminal_time, 'time_delta': args.time_delta, 'transform_action': True, 'drop_feature': args.drop_feature} for s in range(args.num_envs)]
+        configs = [{**base_cfg, 'seed': args.seed + s, 'transform_action': True} for s in range(args.num_envs)]
     env_fns = [make_env(config) for config in configs]
-    envs = gym.vector.AsyncVectorEnv(env_fns=env_fns)
+    envs = gym.vector.SyncVectorEnv(env_fns=env_fns)
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
     observation, info = envs.reset(seed=args.seed)
     print(f'observation space: {envs.single_observation_space}, action space: {envs.single_action_space}')
@@ -808,12 +801,22 @@ if __name__ == "__main__":
             rewards[step] = reward_gpu.view(-1)
             next_done = next_done_gpu
 
+            # SyncVectorEnv: terminated env info is in infos directly with _key masks
+            # AsyncVectorEnv: uses final_info list
             if "final_info" in infos:
                 for info in infos["final_info"]:
                     if info is not None:
                         returns.append(info['reward'])
                         times.append(info['time'])
                         drifts.append(info['drift'])
+            elif "_reward" in infos:
+                # SyncVectorEnv format: _reward is a bool mask for which envs terminated
+                mask = infos["_reward"]
+                for i, done in enumerate(mask):
+                    if done and terminations[i]:
+                        returns.append(infos['reward'][i])
+                        times.append(infos['time'][i])
+                        drifts.append(infos['drift'][i])
         
         writer.add_scalar("charts/return", np.mean(returns), global_step)
         writer.add_scalar("charts/time", np.mean(times), global_step)
@@ -876,13 +879,20 @@ if __name__ == "__main__":
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
+                with torch.no_grad():
+                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    old_approx_kl = (-logratio).mean()
+                    approx_kl = ((ratio - 1) - logratio).mean()
+                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # Policy loss modified 
-                pg_loss = -mb_advantages * newlogprob
-                pg_loss = pg_loss.mean()
+                # PPO clipped surrogate loss (Schulman et al., 2017)
+                pg_loss1 = -mb_advantages * ratio
+                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 # Value loss
                 newvalue = newvalue.view(-1)
@@ -906,9 +916,13 @@ if __name__ == "__main__":
 
                 optimizer.zero_grad()
                 loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
-        
+            if args.target_kl is not None and approx_kl > args.target_kl:
+                break
+
+
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
@@ -919,6 +933,9 @@ if __name__ == "__main__":
         writer.add_scalar("losses/total_loss", loss, global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
+        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
+        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
 
         # Log variance only for agents that have variance scaling
         if hasattr(agent, 'variance') and (args.exp_name == 'log_normal' or args.exp_name == 'normal' or args.exp_name == 'bilateral_log_normal'):
@@ -939,7 +956,7 @@ if __name__ == "__main__":
         # Use SINGLE non-vectorized environment to avoid AsyncVectorEnv final_info issues
         config = {'market_env': args.env_type, 'execution_agent': 'rl_agent', 'volume': args.num_lots,
                   'seed': args.eval_seed, 'terminal_time': args.terminal_time, 'time_delta': args.time_delta,
-                  'drop_feature': args.drop_feature}
+                  'drop_feature': args.drop_feature, 'maker_rebate': args.maker_rebate, 'taker_fee': args.taker_fee}
         print('evaluation config:')
         print(config)
 

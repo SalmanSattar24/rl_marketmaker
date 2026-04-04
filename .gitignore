@@ -42,3 +42,21 @@ volume_curves/*
 volume_curves
 actions/*
 actions
+
+# Claude Code internal config
+.claude/
+
+# Model checkpoints (binary, large)
+checkpoints/
+
+# Pytest cache
+.pytest_cache/
+
+# Training logs and ephemeral outputs
+training_log.txt
+*.log
+phase4_results_flow.json
+
+# Generated notebook exports
+*.html
+*.pdf

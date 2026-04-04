@@ -14,6 +14,7 @@ from .config import (
     strategic_agent_config,
     initial_agent_config,
     observation_agent_config,
+    fee_config,
 )
 
 __all__ = [
@@ -25,4 +26,5 @@ __all__ = [
     "strategic_agent_config",
     "initial_agent_config",
     "observation_agent_config",
+    "fee_config",
 ]

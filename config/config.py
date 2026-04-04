@@ -121,3 +121,25 @@ observation_agent_config['start_time'] = 0
 observation_agent_config['terminal_time'] = 135
 observation_agent_config['time_delta'] = 15
 
+# Maker-taker fee structure
+#
+# Fee formula in reward space:
+#   taker cost  = taker_fee  * filled_vol / initial_volume  (subtracted from reward)
+#   maker bonus = maker_rebate * filled_vol / initial_volume (added to reward)
+#
+# Calibration (ref_price=1000, initial_volume=20):
+#   1 lot, 1 tick profit = 0.05 reward units
+#   taker_fee=0.3  → 1 lot costs  0.3/20 = 0.015 (30% of 1-tick profit)
+#   maker_rebate=0.2 → 1 lot earns 0.2/20 = 0.010 (20% of 1-tick profit)
+#   Net exchange revenue = (0.3 - 0.2) / 20 = 0.005 per lot (realistic ~1bp spread)
+#
+# Effect on a full 20-lot episode:
+#   All market orders: total fee = 0.3 penalty
+#   All limit fills:   total rebate = 0.2 bonus
+#   Delta = 0.5 reward units — strong incentive to be passive
+#
+# Set both to 0.0 to disable fees (backward compatible)
+fee_config = {}
+fee_config['maker_rebate'] = 0.2
+fee_config['taker_fee'] = 0.3
+

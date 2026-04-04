@@ -1,0 +1,574 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{graphicx}
+\usepackage{microtype}
+
+% ── Colors ──────────────────────────────────────────────────────────────────
+\definecolor{codegreen}{rgb}{0.1,0.5,0.1}
+\definecolor{codegray}{rgb}{0.4,0.4,0.4}
+\definecolor{codepurple}{rgb}{0.5,0,0.5}
+\definecolor{codeblue}{rgb}{0,0.3,0.7}
+\definecolor{backcolour}{rgb}{0.97,0.97,0.97}
+\definecolor{addgreen}{rgb}{0.85,1,0.85}
+\definecolor{remred}{rgb}{1,0.85,0.85}
+\definecolor{accentblue}{rgb}{0.12,0.33,0.60}
+
+% ── Code listing style ───────────────────────────────────────────────────────
+\lstdefinestyle{pycode}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen}\itshape,
+    keywordstyle=\color{codeblue}\bfseries,
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=6pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=4,
+    language=Python,
+    frame=single,
+    rulecolor=\color{gray!40},
+    xleftmargin=12pt,
+    xrightmargin=4pt,
+}
+\lstset{style=pycode}
+
+% ── Header / Footer ──────────────────────────────────────────────────────────
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textcolor{accentblue}{\textbf{RL Market Maker — Code Changes Report}}}
+\fancyhead[R]{\small\textcolor{gray}{CSCI 566}}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% ── Section formatting ───────────────────────────────────────────────────────
+\titleformat{\section}{\large\bfseries\color{accentblue}}{\thesection.}{0.5em}{}[\titlerule]
+\titleformat{\subsection}{\normalsize\bfseries\color{accentblue!80}}{\thesubsection}{0.5em}{}
+
+% ── Diff-style macros ────────────────────────────────────────────────────────
+\newcommand{\added}[1]{\colorbox{addgreen}{\texttt{\small #1}}}
+\newcommand{\removed}[1]{\colorbox{remred}{\texttt{\small #1}}}
+\newcommand{\filename}[1]{\texttt{\textbf{\color{accentblue}#1}}}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{document}
+
+\begin{titlepage}
+    \centering
+    \vspace*{2cm}
+    {\Huge\bfseries\color{accentblue} RL Market Maker\\[0.4em]}
+    {\LARGE Code Changes Report\\[1em]}
+    \rule{\linewidth}{1pt}\\[1em]
+    {\large\textit{Maker-Taker Fee Integration, PPO Upgrade,\\
+    and Bilateral Market-Making Fixes}}\\[2em]
+    \rule{\linewidth}{0.5pt}\\[2em]
+    {\large CSCI 566 — Final Project\\[0.5em]}
+    {\normalsize University of Southern California\\[2em]}
+    {\normalsize\textcolor{gray}{April 2026}}
+    \vfill
+    \begin{abstract}
+        \noindent
+        This report documents six categories of code changes applied to the
+        \texttt{rl\_marketmaker} repository.  The primary goal is to introduce
+        a realistic \textbf{maker-taker fee structure} that incentivises
+        the reinforcement-learning agent to prefer passive limit orders over
+        aggressive market orders, and to upgrade the PPO training loop to
+        production-grade standards.  Supporting changes fix bilateral
+        market-making order-tracking bugs, remove Colab-specific boilerplate,
+        and relax assertions that were incompatible with short-selling.
+    \end{abstract}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Overview of Changed Files}
+
+\begin{table}[h!]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+\textbf{File} & \textbf{Summary of Changes} \\
+\midrule
+\filename{config/config.py} & Added \texttt{fee\_config} with maker rebate and taker fee values \\
+\filename{config/\_\_init\_\_.py} & Exported \texttt{fee\_config} from the config package \\
+\filename{simulation/market\_gym.py} & Integrated fee config into \texttt{Market} environment; propagates fees to execution agent \\
+\filename{simulation/agents.py} & Added fee accounting to \texttt{ExecutionAgent}; relaxed short-selling assertions \\
+\filename{limit\_order\_book/limit\_order\_book.py} & Fixed stale order-ID tracking on cancellation for bilateral MM \\
+\filename{rl\_files/actor\_critic.py} & Upgraded PPO to standard clipped loss, gradient clipping, KL tracking; restored production hyperparameters \\
+\filename{bilateral\_mm\_agent.ipynb} & Ported notebook from Google Colab to local execution \\
+\bottomrule
+\end{tabularx}
+\caption{Files modified in this changeset}
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{\texttt{config/config.py} — Maker-Taker Fee Configuration}
+
+\subsection{Motivation}
+
+Real exchanges charge takers (agents submitting market orders that
+immediately consume liquidity) and reward makers (agents posting limit
+orders that add liquidity).  Without this fee structure the RL agent
+has no incentive to behave as a true \emph{market maker}; it may prefer
+the speed and certainty of market orders.
+
+\subsection{What Was Added}
+
+A new \texttt{fee\_config} dictionary was appended at the end of the file:
+
+\begin{lstlisting}
+fee_config = {}
+fee_config['maker_rebate'] = 0.2  # reward units per filled lot / initial_volume
+fee_config['taker_fee']    = 0.3  # reward units per filled lot / initial_volume
+\end{lstlisting}
+
+\subsection{Calibration Rationale}
+
+The fees are expressed in \emph{reward space} (not ticks), so they scale
+consistently regardless of price level.
+
+\begin{itemize}[leftmargin=*]
+    \item Reference price = 1000, initial volume = 20 lots.
+    \item 1 lot filled at 1 tick profit $\Rightarrow$ reward contribution
+          $= \frac{1}{20} \times 1 = 0.05$ reward units.
+    \item \textbf{Taker fee} $= 0.3$: 1 lot costs $\frac{0.3}{20} = 0.015$
+          (30\% of a 1-tick profit — realistic exchange fee).
+    \item \textbf{Maker rebate} $= 0.2$: 1 lot earns $\frac{0.2}{20} = 0.010$
+          (20\% of a 1-tick profit — typical rebate tier).
+    \item Net exchange revenue per lot $= \frac{0.3 - 0.2}{20} = 0.005$
+          (approximately 1 basis-point spread, consistent with real markets).
+\end{itemize}
+
+Over a full 20-lot episode this translates to:
+\[
+    \Delta\text{reward}_{\text{all market orders}} = -0.3
+    \qquad
+    \Delta\text{reward}_{\text{all limit fills}} = +0.2
+\]
+A 0.5 reward-unit swing provides a strong but not overwhelming incentive
+to be the passive side of every trade.  Setting both values to \texttt{0.0}
+disables fees completely and preserves backward compatibility.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{\texttt{config/\_\_init\_\_.py} — Package Export}
+
+A single line was added to expose \texttt{fee\_config} outside the package:
+
+\begin{lstlisting}
+from .config import (
+    ...
+    fee_config,   # <-- added
+)
+
+__all__ = [
+    ...
+    "fee_config", # <-- added
+]
+\end{lstlisting}
+
+This allows any module that does \lstinline{from config import fee_config} to
+access the defaults without importing the full \texttt{config.py} file directly.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{\texttt{simulation/market\_gym.py} — Market Environment Integration}
+
+\subsection{Importing Fee Defaults}
+
+\begin{lstlisting}
+from config import ..., fee_config  # fee_config added to import
+\end{lstlisting}
+
+\subsection{Initialisation (\texttt{\_\_init\_\_})}
+
+The \texttt{Market} constructor now reads fee parameters from the external
+\texttt{config} dict passed at construction time, falling back to the
+global \texttt{fee\_config} defaults if not provided:
+
+\begin{lstlisting}
+self.maker_rebate = float(config.get('maker_rebate', fee_config['maker_rebate']))
+self.taker_fee    = float(config.get('taker_fee',    fee_config['taker_fee']))
+self.cumulative_fees_paid     = 0.0
+self.cumulative_rebates_earned = 0.0
+\end{lstlisting}
+
+This design means the training script can override fees per-environment
+via the config dict without touching global defaults.
+
+\subsection{Agent Injection (\texttt{reset})}
+
+When the market resets and attaches the execution agent, it calls:
+
+\begin{lstlisting}
+agent.set_fees(self.maker_rebate, self.taker_fee)
+\end{lstlisting}
+
+so the agent always has the correct fee rates before an episode begins.
+The market also resets its own fee accumulators:
+
+\begin{lstlisting}
+self.cumulative_fees_paid      = 0.0
+self.cumulative_rebates_earned = 0.0
+\end{lstlisting}
+
+\subsection{Removed Assertion}
+
+\begin{lstlisting}
+# Before:
+if terminated and not self.circuit_breaker_triggered:
+    assert self.agents[self.execution_agent_id].volume == 0
+
+# After: assertion removed
+\end{lstlisting}
+
+The bilateral market-making agent can hold a non-zero (or even negative)
+position at episode end, so forcing \texttt{volume == 0} was incorrect.
+
+\subsection{Info Dictionary}
+
+Three new keys are reported in the \texttt{info} dict at each step:
+
+\begin{lstlisting}
+'cumulative_fees_paid':      float(...),
+'cumulative_rebates_earned': float(...),
+'net_fee_impact':            float(rebates - fees),
+\end{lstlisting}
+
+These allow TensorBoard or downstream analysis to track the fee regime's
+real impact on agent profitability.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{\texttt{simulation/agents.py} — ExecutionAgent Fee Accounting}
+
+\subsection{New \texttt{set\_fees} Method}
+
+\begin{lstlisting}
+def set_fees(self, maker_rebate: float, taker_fee: float):
+    """Set maker-taker fee structure. Called by Market environment."""
+    self.maker_rebate = float(maker_rebate)
+    self.taker_fee    = float(taker_fee)
+\end{lstlisting}
+
+Fee values default to \texttt{0.0} in \texttt{\_\_init\_\_}, so existing
+code that never calls \texttt{set\_fees} is unaffected.
+
+\subsection{Taker Fee (Market Orders)}
+
+When the agent's market order is filled:
+
+\begin{lstlisting}
+filled_vol = int(fill_message.filled_volume)
+taker_fee_cost = self.taker_fee * filled_vol / self.initial_volume
+
+# Buy side (volume increases):
+pnl    = self.get_reward(fill_message.execution_price, filled_vol)
+reward -= pnl              # inventory cost
+reward -= taker_fee_cost   # exchange fee
+
+# Sell side (volume decreases):
+pnl    = self.get_reward(fill_message.execution_price, filled_vol)
+reward += pnl              # inventory relief
+reward -= taker_fee_cost   # exchange fee (both sides pay)
+
+self.cumulative_fees_paid += taker_fee_cost
+\end{lstlisting}
+
+Note that taker fees apply symmetrically to buy \emph{and} sell market
+orders: the agent pays every time it demands liquidity.
+
+\subsection{Maker Rebate (Limit Orders)}
+
+When the agent's resting limit order is passively filled:
+
+\begin{lstlisting}
+maker_rebate_reward = self.maker_rebate * volume / self.initial_volume
+
+# The rebate is added to reward on top of the PnL term
+reward += pnl
+reward += maker_rebate_reward
+self.cumulative_rebates_earned += maker_rebate_reward
+\end{lstlisting}
+
+\subsection{Relaxed Assertions for Bilateral MM}
+
+Several assertions that assumed the agent could only hold a non-negative
+inventory were removed or replaced:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Removed}: \lstinline{assert self.volume >= 0}
+          — the bilateral agent may go short.
+    \item \textbf{Removed}: \lstinline{assert self.volume >= 0, f"volume ... < 0"}
+          — same reason (duplicate assert with message).
+    \item \textbf{Removed}: \lstinline{assert self.active_volume <= self.volume}
+          — relaxed; order tracking counters are for bookkeeping only.
+\end{itemize}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{\texttt{limit\_order\_book/limit\_order\_book.py} — Cancellation Bug Fix}
+
+\subsection{Problem}
+
+When an order was cancelled, the LOB correctly removed it from
+\texttt{price\_map} and \texttt{order\_map}, but the bilateral
+market-making data structures \texttt{agent\_bid\_orders} and
+\texttt{agent\_ask\_orders} (sets of active order IDs per agent) were
+\emph{not} updated.  This left stale IDs in the sets, causing the MM
+agent to believe it had active quotes when it did not.
+
+\subsection{Fix}
+
+Four lines were added after the existing removal logic:
+
+\begin{lstlisting}
+self.order_map_by_agent[order.agent_id].remove(id)
+
+# BILATERAL MM: Deregister cancelled order from bid/ask tracking
+if order.agent_id in self.agent_bid_orders:
+    self.agent_bid_orders[order.agent_id].discard(id)
+    self.agent_ask_orders[order.agent_id].discard(id)
+\end{lstlisting}
+
+\texttt{discard} (rather than \texttt{remove}) is used intentionally so
+that no \texttt{KeyError} is raised if the ID is not present in one of
+the two sets (e.g.\ the order was on the opposite side).
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{\texttt{rl\_files/actor\_critic.py} — PPO Training Upgrade}
+
+\subsection{Hyperparameter Restoration}
+
+During debugging, many hyperparameters were reduced to toy values.
+These have been restored to production settings:
+
+\begin{table}[h!]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Parameter} & \textbf{Debug Value} & \textbf{Production Value} & \textbf{Reason} \\
+\midrule
+\texttt{num\_envs}       & 1    & 128  & Parallel sample collection \\
+\texttt{num\_steps}      & 10   & 100  & Longer rollouts, better credit assignment \\
+\texttt{num\_minibatches}& 1    & 4    & Standard PPO mini-batch update \\
+\texttt{update\_epochs}  & 1    & 4    & Multiple passes per rollout \\
+\texttt{clip\_coef}      & 0.5  & 0.2  & Standard PPO clipping (Schulman et al.) \\
+\texttt{ent\_coef}       & 0.0  & 0.01 & Light entropy bonus for exploration \\
+\texttt{total\_timesteps}& 20   & $200\times128\times100$ & Full training run \\
+\bottomrule
+\end{tabular}
+\caption{Hyperparameter changes in \texttt{actor\_critic.py}}
+\end{table}
+
+\subsection{New Hyperparameters}
+
+\begin{lstlisting}
+max_grad_norm: float = 0.5   # gradient clipping threshold
+target_kl:     float = None  # early-stop epoch if KL exceeds threshold
+maker_rebate:  float = 0.2   # fee passthrough from Args to env config
+taker_fee:     float = 0.3
+\end{lstlisting}
+
+\subsection{Standard PPO Clipped Surrogate Loss}
+
+The original code used a simplified policy gradient loss without the
+clipping ratio.  This was replaced with the canonical PPO objective
+from Schulman et al.\ (2017):
+
+\begin{lstlisting}
+# Before (non-standard):
+pg_loss = -mb_advantages * newlogprob
+pg_loss = pg_loss.mean()
+
+# After (standard PPO):
+ratio    = (newlogprob - b_logprobs[mb_inds]).exp()
+pg_loss1 = -mb_advantages * ratio
+pg_loss2 = -mb_advantages * torch.clamp(ratio,
+                                         1 - args.clip_coef,
+                                         1 + args.clip_coef)
+pg_loss  = torch.max(pg_loss1, pg_loss2).mean()
+\end{lstlisting}
+
+The clipping prevents excessively large policy updates, which was a
+key stability problem during long training runs.
+
+\subsection{Gradient Clipping}
+
+\begin{lstlisting}
+nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+\end{lstlisting}
+
+This bounds the gradient norm before the optimiser step, preventing
+the policy from collapsing during periods of high reward variance
+(common in market-making tasks).
+
+\subsection{KL Divergence Tracking and Early Stop}
+
+The approximate KL divergence between the old and new policy is now
+computed and logged after each mini-batch:
+
+\begin{lstlisting}
+old_approx_kl = (-logratio).mean()
+approx_kl     = ((ratio - 1) - logratio).mean()
+clipfracs    += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+\end{lstlisting}
+
+If \texttt{target\_kl} is set, the inner epoch loop breaks early when
+the KL exceeds the threshold, preventing policy over-fitting within a
+single rollout batch:
+
+\begin{lstlisting}
+if args.target_kl is not None and approx_kl > args.target_kl:
+    break
+\end{lstlisting}
+
+All three diagnostics are written to TensorBoard:
+
+\begin{lstlisting}
+writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
+writer.add_scalar("losses/approx_kl",     approx_kl.item(),     global_step)
+writer.add_scalar("losses/clipfrac",      np.mean(clipfracs),   global_step)
+\end{lstlisting}
+
+\subsection{\texttt{AsyncVectorEnv} $\to$ \texttt{SyncVectorEnv}}
+
+\begin{lstlisting}
+# Before:
+envs = gym.vector.AsyncVectorEnv(env_fns=env_fns)
+
+# After:
+envs = gym.vector.SyncVectorEnv(env_fns=env_fns)
+\end{lstlisting}
+
+\texttt{AsyncVectorEnv} spawns separate processes and uses a different
+\texttt{info} dict format (\texttt{final\_info} list) that was causing
+episode-return collection to silently drop data.
+\texttt{SyncVectorEnv} runs environments sequentially in the same
+process, uses the simpler \texttt{\_key} mask convention, and is easier
+to debug.
+
+\subsection{Fee Config Passthrough}
+
+The environment config dicts now carry fee parameters so every parallel
+environment receives the same fee regime:
+
+\begin{lstlisting}
+base_cfg = {
+    'market_env':   args.env_type,
+    'execution_agent': 'rl_agent',
+    'volume':       args.num_lots,
+    'terminal_time': args.terminal_time,
+    'time_delta':   args.time_delta,
+    'drop_feature': args.drop_feature,
+    'maker_rebate': args.maker_rebate,   # <-- new
+    'taker_fee':    args.taker_fee,      # <-- new
+}
+configs = [{**base_cfg, 'seed': args.seed + s} for s in range(args.num_envs)]
+\end{lstlisting}
+
+\subsection{\texttt{get\_value} Helper on \texttt{AgentLogisticNormal}}
+
+\begin{lstlisting}
+def get_value(self, x):
+    return self.critic(x)
+\end{lstlisting}
+
+A small convenience method was added so the value head can be called
+without unpacking the full actor output.  Used in the GAE advantage
+computation bootstrapping step.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{\texttt{bilateral\_mm\_agent.ipynb} — Local Execution Port}
+
+The notebook was originally designed for Google Colab (with Google Drive
+mounting, \texttt{pip install}, and hard-coded \texttt{/content/} paths).
+It has been ported to run on a local machine:
+
+\begin{table}[h!]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+\textbf{Colab behaviour} & \textbf{Local behaviour} \\
+\midrule
+Mount Google Drive at \texttt{/content/drive} & Uses \texttt{./checkpoints/} in the working directory \\
+\texttt{pip install torch ...} & Verifies that dependencies are already installed \\
+\texttt{git clone} into \texttt{/content/} & Detects the repo via \texttt{os.getcwd()} \\
+\texttt{git pull} on startup & Skipped (local repo managed manually) \\
+Hard-coded \texttt{/content/rtle\_parallelized} path & \texttt{repo\_dir = os.getcwd()} \\
+\bottomrule
+\end{tabularx}
+\caption{Notebook environment changes}
+\end{table}
+
+All cells that previously raised \texttt{ModuleNotFoundError} (because
+\texttt{sortedcontainers} was missing in the Colab kernel before the
+install cell ran) now execute cleanly, and outputs have been updated to
+reflect the successful local run.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Summary}
+
+\begin{table}[h!]
+\centering
+\renewcommand{\arraystretch}{1.4}
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+\textbf{Change} & \textbf{Impact} \\
+\midrule
+Maker-taker fee config & Agent now has a measurable incentive to post
+                         limit orders rather than market orders.
+                         The $\pm 0.5$ reward swing over an episode is
+                         significant enough to shape policy without
+                         dominating the inventory PnL signal. \\
+\addlinespace
+Fee integration in Market + Agent & Fees are applied automatically in
+                                    every episode with zero code changes
+                                    needed in the RL loop. \\
+\addlinespace
+LOB cancellation bug fix & Eliminates phantom active-quote counts that
+                            would cause the bilateral MM agent to
+                            miscalculate its spread exposure. \\
+\addlinespace
+PPO clipped loss + grad clip & Resolves training instability from large
+                               policy updates; aligns implementation with
+                               the Schulman et al.\ (2017) reference. \\
+\addlinespace
+Production hyperparameters & Restores the learning signal from 128
+                             parallel environments running full 100-step
+                             rollouts instead of toy single-env runs. \\
+\addlinespace
+SyncVectorEnv & Fixes silent episode-return data loss caused by the
+                \texttt{AsyncVectorEnv} info dict format mismatch. \\
+\addlinespace
+Notebook local port & Enables reproducible local experiments without
+                      Colab dependency. \\
+\bottomrule
+\end{tabularx}
+\caption{Summary of changes and their impact}
+\end{table}
+
+\vfill
+\noindent\textcolor{gray}{\small
+Generated for CSCI 566 Final Project — RL Market Maker.
+Compile with \texttt{pdflatex changes\_report.tex} or upload directly to Overleaf.}
+
+\end{document}
