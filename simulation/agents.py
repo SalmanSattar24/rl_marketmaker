@@ -1582,7 +1582,7 @@ class RLAgent(ExecutionAgent):
         # append volumes which are on prices larger than bid + n_levels 
         assert sum(volume_per_level) <= self.active_volume
         volume_per_level.append(self.active_volume-sum(volume_per_level))
-        assert sum(volume_per_level) <= self.volume
+        # Bilateral MM: self.volume can be negative (short), so skip the <= self.volume check
         assert sum(volume_per_level) == self.active_volume
         assert sum([v < 0 for v in volume_per_level]) == 0
         return volume_per_level, orders_within_range
