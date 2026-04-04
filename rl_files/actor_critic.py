@@ -58,10 +58,10 @@ class Args:
     """the id of the environment: noise, flow, strategic"""
     num_lots: int = 20
     """the number of lots"""
-    maker_rebate: float = 0.2
-    """maker rebate per lot for passive limit fills (0.0 to disable)"""
-    taker_fee: float = 0.3
-    """taker fee per lot for aggressive market orders (0.0 to disable)"""
+    maker_rebate: float = 0.0002
+    """maker rebate rate on notional value for passive limit fills (~2 bps, 0.0 to disable)"""
+    taker_fee: float = 0.0003
+    """taker fee rate on notional value for aggressive market orders (~3 bps, 0.0 to disable)"""
     terminal_time: int = 150
     """the terminal time for the execution agent"""
     time_delta: int = 15

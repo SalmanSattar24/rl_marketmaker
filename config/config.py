@@ -121,25 +121,28 @@ observation_agent_config['start_time'] = 0
 observation_agent_config['terminal_time'] = 135
 observation_agent_config['time_delta'] = 15
 
-# Maker-taker fee structure
+# Maker-taker fee structure (fixed rate on notional value)
 #
 # Fee formula in reward space:
-#   taker cost  = taker_fee  * filled_vol / initial_volume  (subtracted from reward)
-#   maker bonus = maker_rebate * filled_vol / initial_volume (added to reward)
+#   taker cost  = taker_fee    * execution_price / initial_volume  (subtracted from reward)
+#   maker bonus = maker_rebate * cash             / initial_volume  (added to reward)
+#
+# where execution_price = sum(price × volume) for all matched lots (total notional)
+#       cash             = sum(price × volume) for all passive fills (total notional)
 #
 # Calibration (ref_price=1000, initial_volume=20):
 #   1 lot, 1 tick profit = 0.05 reward units
-#   taker_fee=0.3  → 1 lot costs  0.3/20 = 0.015 (30% of 1-tick profit)
-#   maker_rebate=0.2 → 1 lot earns 0.2/20 = 0.010 (20% of 1-tick profit)
-#   Net exchange revenue = (0.3 - 0.2) / 20 = 0.005 per lot (realistic ~1bp spread)
+#   taker_fee=0.0003  → 1 lot at price 1000 costs  0.0003×1000/20 = 0.015 (~3 bps, 30% of 1-tick profit)
+#   maker_rebate=0.0002 → 1 lot at price 1000 earns 0.0002×1000/20 = 0.010 (~2 bps, 20% of 1-tick profit)
+#   Net exchange revenue = (0.0003 - 0.0002) × 1000 / 20 = 0.005 per lot (~1 bp spread)
 #
-# Effect on a full 20-lot episode:
-#   All market orders: total fee = 0.3 penalty
-#   All limit fills:   total rebate = 0.2 bonus
-#   Delta = 0.5 reward units — strong incentive to be passive
+# Effect on a full 20-lot episode at price ~1000:
+#   All market orders: total fee ≈ 0.3 penalty
+#   All limit fills:   total rebate ≈ 0.2 bonus
+#   Delta ≈ 0.5 reward units — same incentive magnitude as before, now price-sensitive
 #
 # Set both to 0.0 to disable fees (backward compatible)
 fee_config = {}
-fee_config['maker_rebate'] = 0.2
-fee_config['taker_fee'] = 0.3
+fee_config['maker_rebate'] = 0.0002
+fee_config['taker_fee'] = 0.0003
 

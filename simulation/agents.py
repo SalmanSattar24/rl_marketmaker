@@ -694,8 +694,9 @@ class ExecutionAgent():
             side = fill_message.order.side
             if fill_message.order.agent_id == self.agent_id:
                 filled_vol = int(fill_message.filled_volume)
-                # Taker fee: agent is the aggressor (market order sender)
-                taker_fee_cost = self.taker_fee * filled_vol / self.initial_volume
+                # Taker fee: fixed rate on notional value (rate × execution_price / initial_volume)
+                # execution_price = sum(price × volume) for all matched lots
+                taker_fee_cost = self.taker_fee * fill_message.execution_price / self.initial_volume
                 # ask means buy --> volume increases, negative cash flow
                 if side == 'ask':
                     self.volume += filled_vol
@@ -721,8 +722,9 @@ class ExecutionAgent():
                 for m in fill_message.passive_fills[self.agent_id]:
                     volume += int(m.filled_volume)
                     cash += int(m.filled_volume) * m.order.price
-                # Maker rebate: agent is the passive party (limit order resting)
-                maker_rebate_reward = self.maker_rebate * volume / self.initial_volume
+                # Maker rebate: fixed rate on notional value (rate × cash / initial_volume)
+                # cash = sum(filled_volume × order.price) for all passive fills
+                maker_rebate_reward = self.maker_rebate * cash / self.initial_volume
                 # market side is ask, market buy --> limit sell
                 if side == 'ask':
                     self.active_volume -= volume
