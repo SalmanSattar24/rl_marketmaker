@@ -1289,11 +1289,19 @@ class RLAgent(ExecutionAgent):
             return order_list
 
         elif time == self.terminal_time:
-            return self.sell_remaining_position(lob, time)
+            if self.volume > 0:
+                return self.sell_remaining_position(lob, time)
+            else:
+                # All volume already executed — just cancel any resting orders
+                order_list = []
+                for order_id in list(lob.order_map_by_agent.get(self.agent_id, set())):
+                    if order_id in lob.order_map:
+                        order_list.append(Cancellation(self.agent_id, order_id, time))
+                return order_list if order_list else None
         else:
             return None
 
-    def get_observation(self, time, lob, net_inventory=0, time_weighted_inventory=0):        
+    def get_observation(self, time, lob, net_inventory=0, time_weighted_inventory=0):
         """
             - sets reference prices if time == self.start_time
             - computes observations 

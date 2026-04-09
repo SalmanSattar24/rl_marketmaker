@@ -36,6 +36,8 @@ class Args:
     """seed for evaluation"""
     bilateral: bool = False
     """if toggled, use bilateral market-making agent (BilateralAgentLogisticNormal)"""
+    attention: bool = False
+    """if toggled, use LOB self-attention encoder (BilateralAgentAttention) — implies bilateral"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False"""
     cuda: bool = True
@@ -368,6 +370,352 @@ class DirichletAgent(nn.Module):
         return mean / torch.sum(mean, dim=1, keepdim=True)
 
 
+class LOBAttentionEncoder(nn.Module):
+    """Full Transformer encoder over LOB price levels.
+
+    Each LOB level is treated as a token with features [bid_volume, ask_volume].
+    Applies learned embedding + sinusoidal positional encoding, stacked
+    Transformer blocks (MHSA + FFN + residual + LayerNorm), and learned
+    attention-weighted pooling to produce a fixed-size LOB representation.
+
+    Architecture:
+        tokens → Linear embed + Sinusoidal PE
+            → [MHSA → Add&Norm → FFN(GELU) → Add&Norm] × n_layers
+            → Attention-weighted Pooling → (batch, d_model)
+
+    Key improvements over single-layer MHSA baseline:
+        1. Positional encoding — level ordering matters (best price vs deep book)
+        2. FFN with GELU — adds nonlinear capacity within each block
+        3. Stacked layers — hierarchical feature extraction across levels
+        4. Attention pooling — learned aggregation instead of naive mean pooling
+
+    Reference: Attn-LOB (Guo et al. 2023), DeepLOB (Zhang et al. 2019),
+               TLOB (Berti et al. 2025)
+    """
+
+    def __init__(self, n_levels=5, features_per_level=2, d_model=32, n_heads=2,
+                 n_layers=2, ffn_dim=64, dropout=0.1):
+        super().__init__()
+        self.n_levels = n_levels
+        self.features_per_level = features_per_level
+        self.d_model = d_model
+        self.output_dim = d_model
+
+        # Per-level linear embedding
+        self.embed = layer_init(nn.Linear(features_per_level, d_model))
+
+        # Sinusoidal positional encoding (fixed, not learned)
+        # Encodes level ordering: level 0 = best bid/ask, level K-1 = deepest
+        pe = torch.zeros(n_levels, d_model)
+        position = torch.arange(0, n_levels, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))  # (1, n_levels, d_model)
+
+        # Stacked Transformer blocks: [MHSA → Add&Norm → FFN → Add&Norm] × n_layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=ffn_dim,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,  # Pre-LN for training stability
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        # Attention-weighted pooling: learned query attends over level outputs
+        self.pool_query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.pool_attn = nn.MultiheadAttention(d_model, 1, batch_first=True)
+
+    def forward(self, lob_features):
+        """
+        Args:
+            lob_features: (batch, n_levels, features_per_level)
+        Returns:
+            lob_embedding: (batch, d_model) — attention-pooled transformer output
+        """
+        x = self.embed(lob_features)                  # (batch, n_levels, d_model)
+        x = x + self.pe                                # add positional encoding
+        x = self.transformer(x)                         # (batch, n_levels, d_model)
+
+        # Attention-weighted pooling (learned query)
+        batch_size = x.shape[0]
+        query = self.pool_query.expand(batch_size, -1, -1)  # (batch, 1, d_model)
+        pooled, _ = self.pool_attn(query, x, x)              # (batch, 1, d_model)
+        return pooled.squeeze(1)                               # (batch, d_model)
+
+    @torch.no_grad()
+    def get_attention_maps(self, lob_features):
+        """Extract attention weights from all layers + pooling (inference only).
+
+        Manually replicates the Pre-LN Transformer forward pass with
+        need_weights=True to capture per-head attention matrices.
+
+        Returns:
+            dict with:
+                'layer_attention': list of (batch, n_heads, K, K) per layer
+                'pool_attention':  (batch, 1, K) — pooling query weights
+        """
+        self.eval()
+        x = self.embed(lob_features)
+        x = x + self.pe
+
+        layer_attn_weights = []
+        for layer in self.transformer.layers:
+            # Pre-LN self-attention block (mirrors TransformerEncoderLayer internals)
+            x_norm = layer.norm1(x)
+            attn_out, attn_w = layer.self_attn(
+                x_norm, x_norm, x_norm,
+                need_weights=True, average_attn_weights=False,
+            )
+            x = x + layer.dropout1(attn_out)
+            # Pre-LN FFN block
+            x_norm2 = layer.norm2(x)
+            ff_out = layer.linear2(layer.dropout(layer.activation(layer.linear1(x_norm2))))
+            x = x + layer.dropout2(ff_out)
+            layer_attn_weights.append(attn_w)  # (batch, n_heads, K, K)
+
+        # Pooling attention
+        batch_size = x.shape[0]
+        query = self.pool_query.expand(batch_size, -1, -1)
+        _, pool_w = self.pool_attn(query, x, x, need_weights=True)
+
+        return {
+            'layer_attention': layer_attn_weights,
+            'pool_attention': pool_w,  # (batch, 1, K)
+        }
+
+
+class BilateralAgentAttention(nn.Module):
+    """
+    BILATERAL MARKET-MAKING AGENT WITH LOB TRANSFORMER ENCODER (Plan B1+)
+
+    Same dual-head logistic-normal policy as BilateralAgentLogisticNormal,
+    but replaces the flat bid/ask volume features with a full Transformer-
+    encoded LOB embedding:
+
+        LOB levels [bid_vol, ask_vol] × K
+            → Linear Embedding (d_model=32) + Sinusoidal Positional Encoding
+            → [MHSA(2 heads) → Add&Norm → FFN(GELU) → Add&Norm] × n_layers
+            → Attention-weighted Pooling
+            → LOB embedding (32-dim)
+        [other features, LOB embedding] → Shared Trunk (128-128) → Bid/Ask/Value heads
+
+    Key advantages over flat MLP:
+        - Positional encoding captures level ordering (best price vs deep book)
+        - Stacked Transformer blocks learn hierarchical inter-level patterns
+        - Attention pooling focuses on most informative levels
+        - FFN adds nonlinear capacity within each Transformer block
+    """
+
+    def __init__(self, envs, n_levels=5, drop_feature='drift', use_ofi=False,
+                 d_model=32, n_heads=2, n_layers=2, ffn_dim=64, dropout=0.1,
+                 variance_scaling=True):
+        n_hidden_units = 128
+        super().__init__()
+
+        obs_dim = np.array(envs.single_observation_space.shape).prod()
+        action_dim = np.prod(envs.single_action_space.shape) - 1
+
+        self.n_levels = n_levels
+        self.drop_feature = drop_feature
+        self.use_ofi = use_ofi
+
+        # Compute LOB volume slice indices in the flat observation vector.
+        # Layout: [base | imbalance(1) | bid_vols(K) | ask_vols(K) | ofi? | ...]
+        base_dim = 3 if drop_feature == 'drift' else 5
+        self.bid_start = base_dim + 1          # skip imbalance
+        self.bid_end = self.bid_start + n_levels
+        self.ask_start = self.bid_end
+        self.ask_end = self.ask_start + n_levels
+
+        # LOB Transformer Encoder
+        self.lob_encoder = LOBAttentionEncoder(
+            n_levels=n_levels, features_per_level=2,
+            d_model=d_model, n_heads=n_heads,
+            n_layers=n_layers, ffn_dim=ffn_dim, dropout=dropout,
+        )
+
+        # Trunk input: replace raw bid+ask vols (2*K) with LOB embedding (d_model)
+        trunk_input_dim = obs_dim - 2 * n_levels + self.lob_encoder.output_dim
+
+        # SHARED TRUNK
+        self.trunk = nn.Sequential(
+            layer_init(nn.Linear(trunk_input_dim, n_hidden_units)),
+            nn.LayerNorm(n_hidden_units),
+            nn.Tanh(),
+            layer_init(nn.Linear(n_hidden_units, n_hidden_units)),
+            nn.LayerNorm(n_hidden_units),
+            nn.Tanh(),
+        )
+
+        # CRITIC HEAD
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(n_hidden_units, 1), std=1.0),
+        )
+
+        # BID POLICY HEAD
+        self.actor_mean_bid = nn.Sequential(
+            layer_init(nn.Linear(n_hidden_units, action_dim), std=1e-5),
+        )
+        x_bid = -1.0 * torch.ones(action_dim)
+        x_bid[-1] = 1.0
+        self.actor_mean_bid[-1].bias.data.copy_(x_bid)
+
+        # ASK POLICY HEAD
+        self.actor_mean_ask = nn.Sequential(
+            layer_init(nn.Linear(n_hidden_units, action_dim), std=1e-5),
+        )
+        x_ask = -1.0 * torch.ones(action_dim)
+        x_ask[-1] = 1.0
+        self.actor_mean_ask[-1].bias.data.copy_(x_ask)
+
+        # VARIANCE
+        self.variance_scaling = variance_scaling
+        if variance_scaling:
+            self.variance = 1.0
+        else:
+            self.log_std = nn.Parameter(torch.zeros(action_dim), requires_grad=True)
+
+        self.apply(layer_init)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _encode_obs(self, x):
+        """Replace raw LOB volumes with attention-encoded embedding."""
+        x = torch.nan_to_num(x, nan=0.0, posinf=100.0, neginf=-100.0)
+
+        bid_vols = x[:, self.bid_start:self.bid_end]  # (batch, K)
+        ask_vols = x[:, self.ask_start:self.ask_end]   # (batch, K)
+
+        # Stack as (batch, K, 2) — each level is a token
+        lob_input = torch.stack([bid_vols, ask_vols], dim=-1)
+        lob_emb = self.lob_encoder(lob_input)           # (batch, d_model)
+
+        # Reconstruct: [features_before_bid | lob_emb | features_after_ask]
+        before = x[:, :self.bid_start]
+        after = x[:, self.ask_end:]
+        return torch.cat([before, lob_emb, after], dim=1)
+
+    @torch.no_grad()
+    def get_attention_maps(self, x):
+        """Extract attention maps from the LOB encoder for visualization.
+
+        Args:
+            x: raw flat observation tensor (batch, obs_dim)
+        Returns:
+            dict — see LOBAttentionEncoder.get_attention_maps()
+        """
+        x = torch.nan_to_num(x, nan=0.0, posinf=100.0, neginf=-100.0)
+        bid_vols = x[:, self.bid_start:self.bid_end]
+        ask_vols = x[:, self.ask_start:self.ask_end]
+        lob_input = torch.stack([bid_vols, ask_vols], dim=-1)
+        return self.lob_encoder.get_attention_maps(lob_input)
+
+    def set_variance(self, variance: float):
+        if not self.variance_scaling:
+            raise RuntimeError("set_variance is only available when variance_scaling=True")
+        v = float(variance)
+        if not np.isfinite(v):
+            raise ValueError(f"variance must be finite, got {variance}")
+        self.variance = max(v, 1e-4)
+
+    def get_variance(self) -> float:
+        if not self.variance_scaling:
+            raise RuntimeError("get_variance is only available when variance_scaling=True")
+        return float(self.variance)
+
+    def check_parameters(self):
+        for name, param in self.named_parameters():
+            if torch.isnan(param).any():
+                return True, name
+        return False, None
+
+    # ------------------------------------------------------------------
+    # Forward methods (identical logic to BilateralAgentLogisticNormal)
+    # ------------------------------------------------------------------
+
+    def get_value(self, x):
+        h = self._encode_obs(x)
+        trunk_out = self.trunk(h)
+        return self.critic(trunk_out)
+
+    def get_action_and_value(self, x, action=None, deterministic=False):
+        h = self._encode_obs(x)
+        trunk_out = self.trunk(h)
+
+        bid_mean = self.actor_mean_bid(trunk_out)
+        ask_mean = self.actor_mean_ask(trunk_out)
+
+        if self.variance_scaling:
+            bid_std = torch.ones_like(bid_mean) * self.variance
+            ask_std = torch.ones_like(ask_mean) * self.variance
+        else:
+            bid_std = torch.exp(self.log_std).expand_as(bid_mean)
+            ask_std = torch.exp(self.log_std).expand_as(ask_mean)
+
+        bid_std = torch.clamp(bid_std, min=1e-4)
+        ask_std = torch.clamp(ask_std, min=1e-4)
+        bid_mean = torch.nan_to_num(bid_mean, nan=0.0)
+        ask_mean = torch.nan_to_num(ask_mean, nan=0.0)
+
+        bid_dist = Normal(bid_mean, bid_std)
+        ask_dist = Normal(ask_mean, ask_std)
+
+        with torch.no_grad():
+            if action is None:
+                bid_base = bid_dist.sample()
+                ask_base = ask_dist.sample()
+
+                z_bid = 1 + torch.sum(torch.exp(bid_base), dim=1, keepdim=True)
+                bid_action = torch.exp(bid_base) / z_bid
+                bid_action = torch.cat((bid_action, 1 / z_bid), dim=1)
+
+                z_ask = 1 + torch.sum(torch.exp(ask_base), dim=1, keepdim=True)
+                ask_action = torch.exp(ask_base) / z_ask
+                ask_action = torch.cat((ask_action, 1 / z_ask), dim=1)
+            else:
+                bid_action, ask_action = action
+                bid_last = bid_action[:, -1].reshape(-1, 1)
+                bid_base = torch.log(bid_action[:, :-1] / bid_last)
+                ask_last = ask_action[:, -1].reshape(-1, 1)
+                ask_base = torch.log(ask_action[:, :-1] / ask_last)
+
+        bid_log_prob = bid_dist.log_prob(bid_base).sum(1)
+        ask_log_prob = ask_dist.log_prob(ask_base).sum(1)
+        log_prob_joint = bid_log_prob + ask_log_prob
+
+        bid_entropy = bid_dist.entropy().sum(1)
+        ask_entropy = ask_dist.entropy().sum(1)
+        entropy_joint = bid_entropy + ask_entropy
+
+        actions = (bid_action, ask_action)
+        return actions, log_prob_joint, entropy_joint, self.critic(trunk_out)
+
+    def deterministic_action(self, x):
+        h = self._encode_obs(x)
+        trunk_out = self.trunk(h)
+        bid_mean = self.actor_mean_bid(trunk_out)
+        ask_mean = self.actor_mean_ask(trunk_out)
+
+        with torch.no_grad():
+            z_bid = 1 + torch.sum(torch.exp(bid_mean), dim=1, keepdim=True)
+            bid_action = torch.exp(bid_mean) / z_bid
+            bid_action = torch.cat((bid_action, 1 / z_bid), dim=1)
+
+            z_ask = 1 + torch.sum(torch.exp(ask_mean), dim=1, keepdim=True)
+            ask_action = torch.exp(ask_mean) / z_ask
+            ask_action = torch.cat((ask_action, 1 / z_ask), dim=1)
+
+        return (bid_action, ask_action)
+
+
 class BilateralAgentLogisticNormal(nn.Module):
     """
     BILATERAL MARKET-MAKING AGENT (Phase 2.3)
@@ -693,9 +1041,18 @@ if __name__ == "__main__":
 
     # agent set up. we have three cases log_normal, dirichlet, and normal
     # Also add bilateral variant for market-making
-    print(f'Bilateral mode: {args.bilateral}')
+    # --attention implies --bilateral
+    if args.attention:
+        args.bilateral = True
+    print(f'Bilateral mode: {args.bilateral}, Attention: {args.attention}')
 
-    if args.bilateral:
+    if args.attention:
+        print('Using BilateralAgentAttention (LOB self-attention encoder)')
+        agent = BilateralAgentAttention(
+            envs, n_levels=5, drop_feature=args.drop_feature, use_ofi=False,
+        ).to(device)
+        args.exp_name = 'bilateral_attention'
+    elif args.bilateral:
         print('Using BilateralAgentLogisticNormal for bilateral market-making')
         agent = BilateralAgentLogisticNormal(envs).to(device)
         args.exp_name = 'bilateral_log_normal'
@@ -751,8 +1108,8 @@ if __name__ == "__main__":
             optimizer.param_groups[0]["lr"] = lrnow
             print(f' the lerning rate is {lrnow}')        
         # manual standard deviation scalig. updated this to 0.1
-        if args.exp_name == 'log_normal' or args.exp_name == 'normal' or args.exp_name == 'bilateral_log_normal':
-            agent.variance = (0.32-1)*(iteration)/(args.num_iterations-1) + 1        
+        if args.exp_name in ('log_normal', 'normal', 'bilateral_log_normal', 'bilateral_attention'):
+            agent.variance = (0.32-1)*(iteration)/(args.num_iterations-1) + 1
         # dirichlet agent does not use variance scaling 
         # agent.variance = 1 - iteration/(args.num_iterations+1) + 5e-1
         # keep same variance throughout the training
@@ -776,8 +1133,9 @@ if __name__ == "__main__":
                 bid_action, ask_action = action
                 bid_actions[step] = bid_action
                 ask_actions[step] = ask_action
-                # Pass tuple to environment
-                env_action = (bid_action.cpu().numpy(), ask_action.cpu().numpy())
+                # Flatten to (num_envs, 14) for SyncVectorEnv compatibility
+                # generate_order handles len(action)==14 by splitting into bid/ask
+                env_action = torch.cat([bid_action, ask_action], dim=1).cpu().numpy()
             else:
                 actions[step] = action
                 env_action = action.cpu().numpy()
@@ -938,7 +1296,7 @@ if __name__ == "__main__":
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
 
         # Log variance only for agents that have variance scaling
-        if hasattr(agent, 'variance') and (args.exp_name == 'log_normal' or args.exp_name == 'normal' or args.exp_name == 'bilateral_log_normal'):
+        if hasattr(agent, 'variance') and args.exp_name in ('log_normal', 'normal', 'bilateral_log_normal', 'bilateral_attention'):
             writer.add_scalar("values/variance", agent.variance, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)

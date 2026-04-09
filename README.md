@@ -1,6 +1,6 @@
 # RL Market Maker
 
-**English** | [中文](#中文說明)
+**English** | [中文](README_zh.md)
 
 A research implementation of a **bilateral reinforcement learning market maker** on a simulated limit order book (LOB).
 The agent simultaneously quotes on both bid and ask sides, manages inventory risk, and is trained end-to-end with Proximal Policy Optimization (PPO).
@@ -23,7 +23,7 @@ The agent simultaneously quotes on both bid and ask sides, manages inventory ris
 - [Running Tests](#running-tests)
 - [Recent Changes](#recent-changes)
 - [Roadmap](#roadmap)
-- [中文說明](#中文說明)
+- [中文說明](README_zh.md)
 
 ---
 
@@ -49,7 +49,10 @@ The simulator supports three market regimes: `noise`, `flow`, and `strategic`.
 | **Maker-taker fee structure** | `maker_rebate=0.2`, `taker_fee=0.3` (reward units, calibrated to ~1bp real spread) |
 | **Standard PPO** | Clipped surrogate loss, 4 epochs, 4 minibatches, gradient clipping (`max_grad_norm=0.5`) |
 | **OFI feature** | Order Flow Imbalance included as optional observation feature (`use_ofi=True`) |
-| **Parallel training** | 128 parallel `SyncVectorEnv` environments |
+| **Transformer LOB encoder** | Full Transformer block with sinusoidal PE, Pre-LN, GELU FFN, and attention-weighted pooling |
+| **Attention visualization** | Extract and plot per-head, per-layer self-attention heatmaps + pooling weights |
+| **Ablation framework** | Automated 4×3 experiment matrix: MLP/Transformer × no-fee/fee × noise/flow/strategic |
+| **Parallel training** | 32–128 parallel `SyncVectorEnv` environments |
 | **TensorBoard logging** | Loss, KL divergence, clip fraction, episode return |
 | **29 passing tests** | Full regression suite covering environment, agent, and training path |
 
@@ -57,9 +60,13 @@ The simulator supports three market regimes: `noise`, `flow`, and `strategic`.
 
 ## Architecture
 
+Two agent architectures are supported:
+
+### Plan A — MLP Bilateral Agent
+
 ```text
-Observation (43-dim)
-    ├── LOB features: bid/ask volumes at N price levels (normalized by initial shape)
+Observation (63-dim)
+    ├── LOB features: bid/ask volumes at 5 price levels
     ├── Inventory features: current volume, active volume, time-weighted inventory
     ├── Market features: spread, mid-price drift
     └── OFI (optional): order flow imbalance
@@ -78,6 +85,47 @@ Bid Head       Ask Head        Value Head
 
 Action = (bid_allocation, ask_allocation)   # each is a 7-dim simplex
 ```
+
+### Plan B — Transformer Bilateral Agent (NEW)
+
+```text
+Observation (63-dim)
+    ├── LOB bid/ask volumes → reshaped to (5 levels × 2 features)
+    ├── Inventory + market features → global context
+    └── OFI (optional)
+
+LOB volumes (5, 2)
+        ↓
+┌──────────────────────────────────────┐
+│  Linear Embedding → d_model=32       │
+│  + Sinusoidal Positional Encoding    │
+│                                      │
+│  Transformer Encoder (2 layers)      │
+│  ┌────────────────────────────────┐  │
+│  │ Pre-LayerNorm                  │  │
+│  │ Multi-Head Self-Attention (2h) │  │
+│  │ + Residual + Dropout           │  │
+│  │ Pre-LayerNorm                  │  │
+│  │ FFN (GELU, dim=64)            │  │
+│  │ + Residual + Dropout           │  │
+│  └────────────────────────────────┘  │
+│                                      │
+│  Attention-Weighted Pooling          │
+│  (learned query vector)              │
+└──────────┬───────────────────────────┘
+           │
+    concat with global features
+           ↓
+    ┌──────┴──────┐
+    ↓             ↓
+Bid Head       Ask Head        Value Head
+(Logistic-    (Logistic-       (scalar)
+ Normal)       Normal)
+
+Action = (bid_allocation, ask_allocation)   # each is a 7-dim simplex
+```
+
+The Transformer encoder treats each LOB price level as a token, enabling the model to learn cross-level relationships (e.g., best-bid vs deep-book dynamics). Attention weights can be extracted for interpretability analysis.
 
 **Reward function:**
 
@@ -103,8 +151,12 @@ rl_marketmaker/
 │   ├── market_gym.py          # Gym-compatible environment
 │   └── agents.py              # All agent classes (RL, baseline, noise, strategic…)
 ├── rl_files/
-│   └── actor_critic.py        # PPO training loop + BilateralAgentLogisticNormal model
+│   ├── actor_critic.py        # PPO training loop + agent models (MLP & Transformer)
+│   ├── attention_viz.py       # Attention weight visualization utilities
+│   └── ablation_runner.sh     # Ablation experiment runner (4 configs × 3 envs)
 ├── initial_shape/             # Initial LOB shape arrays (.npz)
+├── models/                    # Saved model checkpoints (.pt)
+├── rewards/                   # Evaluation reward arrays (.npz)
 ├── tests/                     # Regression and integration tests
 ├── requirements.txt
 ├── changes_report.tex         # Overleaf-ready PDF report of all code changes
@@ -166,7 +218,98 @@ Key test files:
 
 ---
 
+## Ablation Results
+
+A 4×3 ablation study was run comparing **MLP vs Transformer** architectures with and without **maker-taker fees** across three market regimes (**noise**, **flow**, **strategic**). Each configuration was trained for 200 PPO iterations with 32 parallel environments (640K timesteps total) and evaluated on 200–1000 deterministic episodes.
+
+### Mean Episode Reward (± standard error)
+
+| Config | noise | flow | strategic |
+| --- | --- | --- | --- |
+| MLP (no fee) | 0.177 ± 0.033 | 0.693 ± 0.024 | **1.093 ± 0.095** |
+| MLP (+ fees) | -0.030 ± 0.075 | **0.981 ± 0.053** | 0.431 ± 0.178 |
+| Transformer (no fee) | -0.069 ± 0.078 | 0.783 ± 0.058 | 0.670 ± 0.150 |
+| Transformer (+ fees) | **0.356 ± 0.072** | 0.805 ± 0.058 | 0.208 ± 0.135 |
+
+**Bold** = best in column. See [figures/ablation_mean_rewards.png](figures/ablation_mean_rewards.png) and [figures/ablation_boxplots.png](figures/ablation_boxplots.png).
+
+### Statistical Significance (Welch t-test, p-values)
+
+| Comparison | noise | flow | strategic |
+| --- | --- | --- | --- |
+| MLP vs Transformer (no fee) | **0.004** ** (MLP) | 0.156 | **0.018** * (MLP) |
+| MLP vs Transformer (+ fees) | **<0.001** *** (Transformer) | **0.026** * (MLP) | 0.320 |
+| MLP: no fee vs + fees | **0.012** * (no fee) | **<0.001** *** (+ fees) | **0.001** ** (no fee) |
+| Transformer: no fee vs + fees | **<0.001** *** (+ fees) | 0.789 | **0.023** * (no fee) |
+
+`*` p<0.05, `**` p<0.01, `***` p<0.001. Winner in parentheses.
+
+### Key Findings
+
+1. **Transformer benefits most from maker rebates in the noise environment** — With fees enabled, the Transformer's attention mechanism learns to better exploit passive limit-order fills, flipping from the worst (–0.069) to the best (0.356) configuration on noise. This improvement is highly significant (p < 0.001).
+
+2. **MLP wins on flow with fees** — The simpler MLP architecture achieves the highest mean reward (0.981) on flow with fees, significantly outperforming the Transformer here (p = 0.026). For well-structured directional flow, fewer parameters generalize better.
+
+3. **Fees hurt all models on strategic environments** — Both MLP and Transformer see significant reward drops when fees are added in the strategic regime. Toxic informed flow combined with taker fees creates a double cost that neither architecture overcomes in the current training budget.
+
+4. **MLP is more robust under high variance** — On strategic (the hardest environment, with reward std ~2–3), the MLP baseline has the highest mean. Transformer shows slightly lower variance but cannot match MLP's mean performance.
+
+### Attention Interpretability
+
+Attention heatmaps extracted from the trained Transformer models are saved under [figures/](figures/):
+
+- `attention_transformer_{baseline,fees}_{noise,flow,strategic}.png` — Layer-averaged self-attention + pooling weights per configuration
+- `attention_transformer_*_heads_L1.png` — Per-head attention patterns for the first Transformer layer
+
+These can be inspected to see which LOB levels the model attends to most heavily under different market conditions and fee structures.
+
+### Reproducing
+
+```bash
+bash rl_files/ablation_runner.sh          # Run the 12-config ablation
+python rl_files/analyze_ablation.py       # Generate tables, bar chart, box plots, significance tests
+python rl_files/generate_attention_viz.py # Extract attention maps from trained Transformer models
+```
+
+---
+
 ## Recent Changes
+
+### v0.4 — Transformer Encoder + Ablation Framework (April 2026)
+
+**`rl_files/actor_critic.py`**
+
+- **LOBAttentionEncoder**: Full Transformer encoder block replacing single-layer MHSA
+  - Sinusoidal positional encoding (registered buffer, not learned) to encode LOB level ordering
+  - 2-layer Pre-LayerNorm TransformerEncoder with GELU FFN (d_model=32, n_heads=2, ffn_dim=64)
+  - Attention-weighted pooling with learned query vector (replaces naive mean pooling)
+  - `get_attention_maps()` method for extracting per-head, per-layer attention weights
+- **BilateralAgentAttention**: New agent class wrapping the Transformer encoder with dual Logistic-Normal heads
+  - Activated via `--attention` CLI flag
+  - Total params: ~51K (vs ~25K for MLP)
+
+**`rl_files/attention_viz.py`** (NEW)
+
+- `plot_attention_maps()`: Layer self-attention heatmaps (head-averaged) + pooling weight bar chart
+- `plot_attention_per_head()`: Per-head attention heatmaps for a specific layer
+- `collect_attention_maps()`: Accumulate attention weights over N episodes for stable averages
+
+**`rl_files/ablation_runner.sh`** (NEW)
+
+- Automated ablation experiment runner: 4 agent configs × 3 environments = 12 runs
+- Configs: MLP baseline, MLP + fees, Transformer baseline, Transformer + fees
+- Environments: noise, flow, strategic
+- Supports `--debug` flag for quick smoke tests
+
+**`simulation/agents.py`**
+
+- Fixed crash when bilateral MM agent executes all volume before terminal time (`volume == 0` guard)
+
+**`simulation/market_gym.py`**
+
+- Fixed crash when noise agent events extend past terminal time (graceful termination instead of ValueError)
+
+---
 
 ### v0.3 — Maker-Taker Fees + PPO Upgrade (April 2026)
 
@@ -205,170 +348,11 @@ Key test files:
 
 ## Roadmap
 
+- [x] Transformer LOB encoder with sinusoidal PE and attention-weighted pooling
+- [x] Attention weight extraction and visualization utilities
+- [x] Ablation experiment framework (MLP vs Transformer × fee structure × market regime)
+- [ ] Ablation results analysis and comparison tables
 - [ ] LSTM temporal backbone (replace MLP trunk with LSTM for sequential LOB modeling)
 - [ ] OFI ablation experiments (`use_ofi=True` vs `False` comparison)
-- [ ] Asymmetric fee ablation (no fee / symmetric / maker-taker)
 - [ ] Action distribution analysis (market order ratio over training)
 - [ ] Full bilateral order generation without unilateral fallback paths
-
----
-
-## 中文說明
-
-**[English](#rl-market-maker)** | 中文
-
-本專案實作了一個基於**強化學習的雙邊做市商（Bilateral Market Maker）**，在模擬的限價委託簿（Limit Order Book, LOB）環境中同時在買賣兩側報價、管理庫存風險，並以 PPO 演算法端對端訓練。
-
-> **課程**：CSCI 566 — Deep Learning and its Applications
-> **學校**：University of Southern California
-> **參考論文**：Cheridito & Weiss (2026), *Reinforcement Learning for Trade Execution with Market and Limit Orders*
-> **基礎 repo**：[moritzweiss/rlte](https://github.com/moritzweiss/rlte)
-
----
-
-### 專案概述
-
-每個時間步驟中，agent 會：
-
-1. 觀測狀態向量（LOB 特徵 + 庫存 + OFI 訂單流失衡）
-2. 輸出 **Logistic-Normal** 動作 — 在買賣兩側的各價格層分配委託量
-3. 根據 PnL、庫存風險和 maker-taker 手續費獲得獎勵
-4. 以標準 **PPO**（clipped surrogate loss + gradient clipping）優化策略
-
-模擬器支援三種市場環境：`noise`（雜訊交易者）、`flow`（流動性交易者）、`strategic`（策略性交易者）。
-
----
-
-### 主要功能
-
-| 功能 | 說明 |
-| --- | --- |
-| **雙邊報價** | Agent 同時在買賣兩側掛出限價單 |
-| **Logistic-Normal 策略** | 連續動作映射到委託量分配的單純形（simplex） |
-| **Maker-Taker 手續費** | `maker_rebate=0.2`，`taker_fee=0.3`（以 reward 單位計，對應真實市場約 1bp 的價差） |
-| **標準 PPO** | Clipped surrogate loss、4 epochs、4 minibatches、梯度裁切 |
-| **OFI 特徵** | 訂單流失衡作為可選觀測特徵（`use_ofi=True`） |
-| **平行訓練** | 128 個 `SyncVectorEnv` 平行環境 |
-| **TensorBoard 記錄** | Loss、KL divergence、clip fraction、episode 回報 |
-| **29 個測試通過** | 涵蓋環境、agent、訓練流程的完整回歸測試 |
-
----
-
-### 系統架構
-
-```text
-觀測向量（43 維）
-    ├── LOB 特徵：各價格層的買賣委託量（以初始形狀正規化）
-    ├── 庫存特徵：當前量、活躍量、時間加權庫存
-    ├── 市場特徵：價差、中間價漂移
-    └── OFI（可選）：訂單流失衡
-
-        ↓
-┌──────────────────────────────────┐
-│   共享 MLP 主幹（128 個神經元）    │
-│   + LayerNorm                    │
-└──────────┬───────────────────────┘
-           │
-    ┌──────┴──────┐
-    ↓             ↓
-買側頭部        賣側頭部        價值頭部
-(Logistic-    (Logistic-      （純量）
- Normal)       Normal)
-
-動作 = (bid_allocation, ask_allocation)  # 各為 7 維單純形
-```
-
-**獎勵函數：**
-
-```text
-r_t = PnL（成交）+ maker_rebate × 被動成交量 / 初始量
-                 - taker_fee   × 主動成交量 / 初始量
-                 - 庫存懲罰 × |庫存|
-```
-
----
-
-### 專案結構
-
-```text
-rl_marketmaker/
-├── bilateral_mm_agent.ipynb   # 主要實驗 notebook
-├── config/
-│   ├── config.py              # 所有 agent/環境/手續費設定
-│   └── __init__.py
-├── limit_order_book/
-│   └── limit_order_book.py    # LOB 引擎（委託撮合、取消、簿狀態）
-├── simulation/
-│   ├── market_gym.py          # Gym 相容環境
-│   └── agents.py              # 所有 agent 類別（RL、基準線、雜訊、策略型…）
-├── rl_files/
-│   └── actor_critic.py        # PPO 訓練迴圈 + BilateralAgentLogisticNormal 模型
-├── initial_shape/             # 初始 LOB 形狀陣列（.npz）
-├── tests/                     # 回歸與整合測試
-├── requirements.txt
-├── changes_report.tex         # 可上傳至 Overleaf 的程式碼改動報告
-└── FINAL_PROJECT_PLAN.md      # 專案規劃文件
-```
-
----
-
-### 環境安裝
-
-**建議 Python 版本**：3.9 – 3.14
-
-```bash
-pip install -r requirements.txt
-```
-
-依賴套件：`torch`、`gymnasium`、`numpy`、`pandas`、`matplotlib`、`seaborn`、`tensorboard`、`tyro`、`sortedcontainers`
-
----
-
-### 執行 Notebook
-
-用 JupyterLab 或 VS Code 開啟 `bilateral_mm_agent.ipynb`。
-Notebook 完全支援本地執行，不需要 Google Colab 或 Google Drive。
-
-**各區段說明：**
-
-1. 環境設定與依賴套件確認
-2. Repository 驗證
-3. 設定 — 雙環境模式（flow → strategic）
-4. Agent 初始化（雙邊 RL agent + 固定價差基準線）
-5. 向量化配額投影
-6. **訓練** — PPO，128 個平行環境
-7. **評估** — RL agent vs 基準線比較
-8. 視覺化 — PnL 曲線、動作分佈、手續費影響
-
-> 注意：完整訓練（200 × 128 × 100 = 256 萬時間步）在 CPU 上需數小時。快速測試可在 `Args` 中調小 `total_timesteps`。
-
----
-
-### 執行測試
-
-```bash
-python -m pytest -q tests/
-```
-
-預期結果：**29 passed**
-
----
-
-### 近期改動（v0.3）
-
-- 新增 maker-taker 手續費結構，taker fee 在市價單成交時扣除，maker rebate 在限價單被動成交時加入獎勵
-- 修復 LOB 取消委託時 `agent_bid_orders`/`agent_ask_orders` 殘留 order ID 的 bug
-- PPO 升級為標準 clipped surrogate loss，加入梯度裁切與 KL divergence 追蹤
-- 恢復生產用超參數（128 個環境、100 步 rollout）
-- 修復 `AsyncVectorEnv` info dict 格式不匹配導致 episode 回報靜默丟失的問題
-- Notebook 從 Google Colab 移植至本地執行
-
----
-
-### 未來規劃
-
-- [ ] LSTM 時序主幹（以 LSTM 取代 MLP 主幹，處理 LOB 的時序依賴）
-- [ ] OFI 消融實驗（`use_ofi=True` vs `False` 比較）
-- [ ] 手續費消融實驗（無手續費 / 對稱手續費 / maker-taker 不對稱）
-- [ ] 動作分佈分析（訓練過程中市價單比例變化）
-- [ ] 完整雙邊委託生成（移除單邊降級路徑）

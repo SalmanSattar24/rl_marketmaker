@@ -261,8 +261,9 @@ class Market(gym.Env):
             self.last_t = t
 
             if t > self.agents[self.execution_agent_id].terminal_time:
-                # simulation should terminate at the execution agents terminal time
-                raise ValueError("time is greater than execution agents terminal time")
+                # Event scheduled past terminal time (e.g. noise agent) — terminate gracefully
+                terminated = True
+                break
             
             if agent_id == 'rl_agent':
                 orders = self.agents[agent_id].generate_order(lob=self.lob, time=t, action=action)
