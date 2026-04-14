@@ -46,8 +46,8 @@ class Args:
     """whether to save model """
     evaluate: bool = True
     """whether to evaluate the model"""
-    n_eval_episodes: int = int(1e4)
-    """the number of episodes to evaluate the model"""
+    n_eval_episodes: int = 200
+    """the number of episodes to evaluate the model (use 10000 for final results)"""
     run_directory: str = 'runs'
     """directory for saving models"""
     run_name:  Optional[str] = None
@@ -68,14 +68,14 @@ class Args:
     """the terminal time for the execution agent"""
     time_delta: int = 15
     """the time delta for the execution agent (150/15 = 10 steps per episode)"""
-    total_timesteps: int = 200 * 128 * 100
-    """total timesteps of the experiments (iterations * num_envs * num_steps)"""
+    total_timesteps: int = 100 * 32 * 50
+    """total timesteps of the experiments (iterations * num_envs * num_steps). Use 200*128*100 for full training."""
     learning_rate: float = 5e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 128
-    """the number of parallel game environments"""
-    num_steps: int = 100
-    """the number of steps to run in each environment per policy rollout"""
+    num_envs: int = 32
+    """the number of parallel game environments (use 128 for full training)"""
+    num_steps: int = 50
+    """the number of steps to run in each environment per policy rollout (use 100 for full training)"""
     anneal_lr: bool = False
     """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 1.0
@@ -926,6 +926,882 @@ class BilateralAgentLogisticNormal(nn.Module):
             bid_action = torch.cat((bid_action, 1 / z_bid), dim=1)
 
             # Logistic transform on ask
+            z_ask = 1 + torch.sum(torch.exp(ask_mean), dim=1, keepdim=True)
+            ask_action = torch.exp(ask_mean) / z_ask
+            ask_action = torch.cat((ask_action, 1 / z_ask), dim=1)
+
+        return (bid_action, ask_action)
+
+
+# ==============================================================================
+# LiT-style architecture (temporal patching + context token)
+# ==============================================================================
+
+
+class LOBPatcher(nn.Module):
+    """Converts (batch, K, 10) LOB volume history into structured LiT patches.
+
+    Each patch spans one side (ask or bid) across a fixed time window.
+    Output order: all ask patches first (oldest→newest), then all bid patches
+    (oldest→newest). This order MUST match the positional embedding IDs in
+    LiTLOBEncoder (0=ctx, 1..n_tw=ask, n_tw+1..2*n_tw=bid).
+    """
+
+    def __init__(self, n_levels: int = 5, K: int = 8, patch_width: int = 2):
+        super().__init__()
+        assert K % patch_width == 0, f"K={K} must be divisible by patch_width={patch_width}"
+        self.n_levels = n_levels
+        self.K = K
+        self.pw = patch_width
+        self.n_time_windows = K // patch_width
+        self.patch_dim = n_levels * patch_width
+
+    def forward(self, lob_history):
+        """
+        Args:
+            lob_history: (batch, K, 10)  — 10 = 5 bid_vols + 5 ask_vols
+        Returns:
+            patches: (batch, 2*n_time_windows, patch_dim)
+        """
+        batch = lob_history.shape[0]
+        bid_vols = lob_history[..., : self.n_levels]        # (batch, K, 5)
+        ask_vols = lob_history[..., self.n_levels :]        # (batch, K, 5)
+
+        bid_vols = bid_vols.transpose(1, 2)                 # (batch, 5, K)
+        ask_vols = ask_vols.transpose(1, 2)                 # (batch, 5, K)
+
+        ask_patches = []
+        bid_patches = []
+        for start in range(0, self.K, self.pw):
+            end = start + self.pw
+            ask_patches.append(ask_vols[:, :, start:end].reshape(batch, -1))
+            bid_patches.append(bid_vols[:, :, start:end].reshape(batch, -1))
+
+        all_patches = ask_patches + bid_patches
+        return torch.stack(all_patches, dim=1)              # (batch, 2*n_tw, patch_dim)
+
+
+class LiTLOBEncoder(nn.Module):
+    """LiT-style LOB encoder with temporal patching + context token.
+
+    Architecture:
+        1. LOBPatcher produces 2*n_time_windows patches from K-step LOB history
+        2. Each patch projected to d_model
+        3. Context features (non-LOB) projected to d_model
+        4. Concatenate [ctx, ask_patches..., bid_patches...] → (batch, n_tokens, d_model)
+        5. Add learnable positional embedding
+        6. Transformer encoder (Pre-LN, GELU)
+        7. Return context token output (position 0) as the LOB embedding
+
+    Why take the context token's output?
+        The context token carries global market state (inventory, time, spread, OFI),
+        so its query represents "what am I looking for given my current state".
+        After the Transformer, its output is "the answer from the LOB given my state".
+    """
+
+    def __init__(
+        self,
+        context_dim: int,
+        n_levels: int = 5,
+        K: int = 8,
+        patch_width: int = 2,
+        d_model: int = 64,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        ffn_dim: int = 128,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.K = K
+        self.patch_width = patch_width
+        self.n_levels = n_levels
+        self.d_model = d_model
+
+        self.patcher = LOBPatcher(n_levels=n_levels, K=K, patch_width=patch_width)
+        patch_dim = self.patcher.patch_dim
+
+        self.patch_proj = layer_init(nn.Linear(patch_dim, d_model))
+        self.context_proj = layer_init(nn.Linear(context_dim, d_model))
+
+        self.n_time_windows = self.patcher.n_time_windows
+        self.n_patches = 2 * self.n_time_windows
+        self.n_tokens = 1 + self.n_patches
+
+        # Position IDs: 0=ctx, 1..n_tw=ask_patches, n_tw+1..2*n_tw=bid_patches
+        self.pos_embedding = nn.Embedding(self.n_tokens, d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=ffn_dim,
+            dropout=dropout,
+            activation="gelu",
+            norm_first=True,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+    def forward(self, lob_history, context_features):
+        """
+        Args:
+            lob_history:      (batch, K, 10)
+            context_features: (batch, context_dim)
+        Returns:
+            context_output:   (batch, d_model) — context token after Transformer
+        """
+        patches = self.patcher(lob_history)                 # (batch, n_patches, patch_dim)
+        patch_emb = self.patch_proj(patches)                # (batch, n_patches, d_model)
+        ctx_emb = self.context_proj(context_features).unsqueeze(1)  # (batch, 1, d_model)
+
+        tokens = torch.cat([ctx_emb, patch_emb], dim=1)     # (batch, n_tokens, d_model)
+
+        positions = torch.arange(self.n_tokens, device=tokens.device)
+        tokens = tokens + self.pos_embedding(positions)
+
+        output = self.transformer(tokens)                   # (batch, n_tokens, d_model)
+        return output[:, 0, :]                              # (batch, d_model)
+
+    @torch.no_grad()
+    def get_attention_maps(self, lob_history, context_features):
+        """Extract per-layer, per-head attention maps for visualization.
+
+        Returns:
+            dict with:
+                'layer_attention': list of (batch, n_heads, n_tokens, n_tokens) per layer
+                'context_attention': (batch, n_heads, n_tokens) — final layer's
+                    attention from context token (row 0) to all tokens
+        """
+        self.eval()
+
+        patches = self.patcher(lob_history)
+        patch_emb = self.patch_proj(patches)
+        ctx_emb = self.context_proj(context_features).unsqueeze(1)
+        tokens = torch.cat([ctx_emb, patch_emb], dim=1)
+
+        positions = torch.arange(self.n_tokens, device=tokens.device)
+        x = tokens + self.pos_embedding(positions)
+
+        layer_attn_weights = []
+        for layer in self.transformer.layers:
+            x_norm = layer.norm1(x)
+            attn_out, attn_w = layer.self_attn(
+                x_norm, x_norm, x_norm,
+                need_weights=True, average_attn_weights=False,
+            )
+            x = x + layer.dropout1(attn_out)
+            x_norm2 = layer.norm2(x)
+            ff_out = layer.linear2(
+                layer.dropout(layer.activation(layer.linear1(x_norm2)))
+            )
+            x = x + layer.dropout2(ff_out)
+            layer_attn_weights.append(attn_w)
+
+        # Context token's attention in the final layer (row 0)
+        context_attention = layer_attn_weights[-1][:, :, 0, :]  # (batch, n_heads, n_tokens)
+
+        return {
+            "layer_attention": layer_attn_weights,
+            "context_attention": context_attention,
+        }
+
+
+class BilateralAgentLiT(nn.Module):
+    """Bilateral market-making agent with LiT-style LOB encoder.
+
+    Compared to BilateralAgentAttention:
+    - Takes (batch, K, obs_dim) history instead of (batch, obs_dim) single snapshot
+    - Uses LiTLOBEncoder (temporal patches + context token)
+    - d_model=64 (vs 32), n_heads=4 (vs 2), dropout=0 (vs 0.1)
+    - Interface is otherwise identical so it plugs into the same training loop
+
+    Expected env wrapping:
+        HistoryWrapper(Market(cfg), history_len=K) → (K, obs_dim) per observation
+    """
+
+    def __init__(
+        self,
+        envs,
+        n_levels: int = 5,
+        K: int = 8,
+        patch_width: int = 2,
+        d_model: int = 64,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        ffn_dim: int = 128,
+        dropout: float = 0.0,
+        drop_feature: str = "drift",
+        use_ofi: bool = False,
+        variance_scaling: bool = True,
+    ):
+        super().__init__()
+        n_hidden_units = 128
+
+        obs_space_shape = envs.single_observation_space.shape
+        assert len(obs_space_shape) == 2, (
+            f"BilateralAgentLiT expects (K, obs_dim) observation space, "
+            f"got {obs_space_shape}. Did you forget to wrap with HistoryWrapper?"
+        )
+        assert obs_space_shape[0] == K, (
+            f"K mismatch: wrapper has history_len={obs_space_shape[0]}, "
+            f"agent was constructed with K={K}"
+        )
+
+        obs_dim = obs_space_shape[1]
+        action_dim = np.prod(envs.single_action_space.shape) - 1
+
+        self.K = K
+        self.n_levels = n_levels
+        self.drop_feature = drop_feature
+        self.use_ofi = use_ofi
+
+        # LOB volume indices within the flat observation (same layout as BilateralAgentAttention)
+        base_dim = 3 if drop_feature == "drift" else 5
+        self.bid_start = base_dim + 1  # skip imbalance
+        self.bid_end = self.bid_start + n_levels
+        self.ask_start = self.bid_end
+        self.ask_end = self.ask_start + n_levels
+
+        # Context = everything except the 2*n_levels LOB volume slots
+        context_dim = obs_dim - 2 * n_levels
+        self.context_dim = context_dim
+
+        self.encoder = LiTLOBEncoder(
+            context_dim=context_dim,
+            n_levels=n_levels,
+            K=K,
+            patch_width=patch_width,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            ffn_dim=ffn_dim,
+            dropout=dropout,
+        )
+
+        self.trunk = nn.Sequential(
+            layer_init(nn.Linear(d_model, n_hidden_units)),
+            nn.LayerNorm(n_hidden_units),
+            nn.Tanh(),
+            layer_init(nn.Linear(n_hidden_units, n_hidden_units)),
+            nn.LayerNorm(n_hidden_units),
+            nn.Tanh(),
+        )
+
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(n_hidden_units, 1), std=1.0),
+        )
+
+        self.actor_mean_bid = nn.Sequential(
+            layer_init(nn.Linear(n_hidden_units, action_dim), std=1e-5),
+        )
+        x_bid = -1.0 * torch.ones(action_dim)
+        x_bid[-1] = 1.0
+        self.actor_mean_bid[-1].bias.data.copy_(x_bid)
+
+        self.actor_mean_ask = nn.Sequential(
+            layer_init(nn.Linear(n_hidden_units, action_dim), std=1e-5),
+        )
+        x_ask = -1.0 * torch.ones(action_dim)
+        x_ask[-1] = 1.0
+        self.actor_mean_ask[-1].bias.data.copy_(x_ask)
+
+        self.variance_scaling = variance_scaling
+        if variance_scaling:
+            self.variance = 1.0
+        else:
+            self.log_std = nn.Parameter(torch.zeros(action_dim), requires_grad=True)
+
+        self.apply(layer_init)
+
+    def _encode_obs(self, x):
+        """
+        Args:
+            x: (batch, K, obs_dim)
+        Returns:
+            trunk_input: (batch, d_model)
+        """
+        x = torch.nan_to_num(x, nan=0.0, posinf=100.0, neginf=-100.0)
+
+        # LOB history: concatenate bid and ask sides in order [bid_vols, ask_vols]
+        bid_hist = x[:, :, self.bid_start : self.bid_end]   # (batch, K, n_levels)
+        ask_hist = x[:, :, self.ask_start : self.ask_end]   # (batch, K, n_levels)
+        lob_history = torch.cat([bid_hist, ask_hist], dim=-1)  # (batch, K, 2*n_levels)
+
+        # Context: latest step's non-LOB features
+        latest = x[:, -1, :]                                   # (batch, obs_dim)
+        before = latest[:, : self.bid_start]
+        after = latest[:, self.ask_end :]
+        context_features = torch.cat([before, after], dim=-1)  # (batch, context_dim)
+
+        return self.encoder(lob_history, context_features)
+
+    @torch.no_grad()
+    def get_attention_maps(self, x):
+        """Extract attention maps from the LiT encoder for visualization."""
+        x = torch.nan_to_num(x, nan=0.0, posinf=100.0, neginf=-100.0)
+        bid_hist = x[:, :, self.bid_start : self.bid_end]
+        ask_hist = x[:, :, self.ask_start : self.ask_end]
+        lob_history = torch.cat([bid_hist, ask_hist], dim=-1)
+        latest = x[:, -1, :]
+        before = latest[:, : self.bid_start]
+        after = latest[:, self.ask_end :]
+        context_features = torch.cat([before, after], dim=-1)
+        return self.encoder.get_attention_maps(lob_history, context_features)
+
+    def set_variance(self, variance: float):
+        if not self.variance_scaling:
+            raise RuntimeError("set_variance is only available when variance_scaling=True")
+        v = float(variance)
+        if not np.isfinite(v):
+            raise ValueError(f"variance must be finite, got {variance}")
+        self.variance = max(v, 1e-4)
+
+    def get_variance(self) -> float:
+        if not self.variance_scaling:
+            raise RuntimeError("get_variance is only available when variance_scaling=True")
+        return float(self.variance)
+
+    def check_parameters(self):
+        for name, param in self.named_parameters():
+            if torch.isnan(param).any():
+                return True, name
+        return False, None
+
+    def get_value(self, x):
+        h = self._encode_obs(x)
+        trunk_out = self.trunk(h)
+        return self.critic(trunk_out)
+
+    def get_action_and_value(self, x, action=None, deterministic=False):
+        h = self._encode_obs(x)
+        trunk_out = self.trunk(h)
+
+        bid_mean = self.actor_mean_bid(trunk_out)
+        ask_mean = self.actor_mean_ask(trunk_out)
+
+        if self.variance_scaling:
+            bid_std = torch.ones_like(bid_mean) * self.variance
+            ask_std = torch.ones_like(ask_mean) * self.variance
+        else:
+            bid_std = torch.exp(self.log_std).expand_as(bid_mean)
+            ask_std = torch.exp(self.log_std).expand_as(ask_mean)
+
+        bid_std = torch.clamp(bid_std, min=1e-4)
+        ask_std = torch.clamp(ask_std, min=1e-4)
+        bid_mean = torch.nan_to_num(bid_mean, nan=0.0)
+        ask_mean = torch.nan_to_num(ask_mean, nan=0.0)
+
+        bid_dist = Normal(bid_mean, bid_std)
+        ask_dist = Normal(ask_mean, ask_std)
+
+        with torch.no_grad():
+            if action is None:
+                bid_base = bid_dist.sample()
+                ask_base = ask_dist.sample()
+
+                z_bid = 1 + torch.sum(torch.exp(bid_base), dim=1, keepdim=True)
+                bid_action = torch.exp(bid_base) / z_bid
+                bid_action = torch.cat((bid_action, 1 / z_bid), dim=1)
+
+                z_ask = 1 + torch.sum(torch.exp(ask_base), dim=1, keepdim=True)
+                ask_action = torch.exp(ask_base) / z_ask
+                ask_action = torch.cat((ask_action, 1 / z_ask), dim=1)
+            else:
+                bid_action, ask_action = action
+                bid_last = bid_action[:, -1].reshape(-1, 1)
+                bid_base = torch.log(bid_action[:, :-1] / bid_last)
+                ask_last = ask_action[:, -1].reshape(-1, 1)
+                ask_base = torch.log(ask_action[:, :-1] / ask_last)
+
+        bid_log_prob = bid_dist.log_prob(bid_base).sum(1)
+        ask_log_prob = ask_dist.log_prob(ask_base).sum(1)
+        log_prob_joint = bid_log_prob + ask_log_prob
+
+        bid_entropy = bid_dist.entropy().sum(1)
+        ask_entropy = ask_dist.entropy().sum(1)
+        entropy_joint = bid_entropy + ask_entropy
+
+        actions = (bid_action, ask_action)
+        return actions, log_prob_joint, entropy_joint, self.critic(trunk_out)
+
+    def deterministic_action(self, x):
+        h = self._encode_obs(x)
+        trunk_out = self.trunk(h)
+        bid_mean = self.actor_mean_bid(trunk_out)
+        ask_mean = self.actor_mean_ask(trunk_out)
+
+        with torch.no_grad():
+            z_bid = 1 + torch.sum(torch.exp(bid_mean), dim=1, keepdim=True)
+            bid_action = torch.exp(bid_mean) / z_bid
+            bid_action = torch.cat((bid_action, 1 / z_bid), dim=1)
+
+            z_ask = 1 + torch.sum(torch.exp(ask_mean), dim=1, keepdim=True)
+            ask_action = torch.exp(ask_mean) / z_ask
+            ask_action = torch.cat((ask_action, 1 / z_ask), dim=1)
+
+        return (bid_action, ask_action)
+
+
+# ==============================================================================
+# LSTM-based bilateral agent (temporal modeling via recurrent state)
+# ==============================================================================
+
+
+class BilateralAgentLSTM(nn.Module):
+    """Bilateral market-making agent with LSTM temporal encoder.
+
+    An alternative to BilateralAgentLiT that uses an LSTM instead of a
+    Transformer for temporal modeling. Expected env wrapping:
+        HistoryWrapper(Market(cfg), history_len=K) -> (K, obs_dim) per observation
+
+    Why LSTM instead of Transformer?
+    - PPO on-policy training is well-known to be fragile with Transformers
+      because self-attention gradients are sensitive to small policy changes
+    - LSTM has a much more stable gradient behavior
+    - For short sequences (K=8) the recurrent overhead is negligible
+    - Hidden state acts as a compact summary of past K steps
+
+    Architecture:
+        (batch, K, obs_dim)
+            -> LSTM(input=obs_dim, hidden=64, 1 layer)
+            -> take last timestep hidden state (batch, 64)
+            -> Shared Trunk (64 -> 128 -> 128)
+            -> Bid / Ask / Value heads
+    """
+
+    def __init__(
+        self,
+        envs,
+        K: int = 8,
+        hidden_size: int = 64,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+        variance_scaling: bool = True,
+    ):
+        super().__init__()
+        n_hidden_units = 128
+
+        obs_space_shape = envs.single_observation_space.shape
+        assert len(obs_space_shape) == 2, (
+            f"BilateralAgentLSTM expects (K, obs_dim) observation space, "
+            f"got {obs_space_shape}. Wrap env with HistoryWrapper first."
+        )
+        assert obs_space_shape[0] == K, (
+            f"K mismatch: wrapper has history_len={obs_space_shape[0]}, "
+            f"agent was constructed with K={K}"
+        )
+
+        obs_dim = obs_space_shape[1]
+        action_dim = np.prod(envs.single_action_space.shape) - 1
+
+        self.K = K
+        self.hidden_size = hidden_size
+
+        self.lstm = nn.LSTM(
+            input_size=obs_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0.0 if num_layers == 1 else dropout,
+        )
+        # Orthogonal init for RNN stability under PPO (standard RL practice).
+        # Also set forget-gate bias to 1 (Jozefowicz et al. 2015) to encourage
+        # long-term memory retention early in training.
+        for name, param in self.lstm.named_parameters():
+            if "weight_ih" in name:
+                nn.init.xavier_uniform_(param)
+            elif "weight_hh" in name:
+                nn.init.orthogonal_(param)
+            elif "bias_ih" in name or "bias_hh" in name:
+                nn.init.zeros_(param)
+                # LSTM bias layout: [input, forget, cell, output], each size hidden_size
+                param.data[hidden_size : 2 * hidden_size].fill_(1.0)
+
+        self.trunk = nn.Sequential(
+            layer_init(nn.Linear(hidden_size, n_hidden_units)),
+            nn.LayerNorm(n_hidden_units),
+            nn.Tanh(),
+            layer_init(nn.Linear(n_hidden_units, n_hidden_units)),
+            nn.LayerNorm(n_hidden_units),
+            nn.Tanh(),
+        )
+
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(n_hidden_units, 1), std=1.0),
+        )
+
+        self.actor_mean_bid = nn.Sequential(
+            layer_init(nn.Linear(n_hidden_units, action_dim), std=1e-5),
+        )
+        x_bid = -1.0 * torch.ones(action_dim)
+        x_bid[-1] = 1.0
+        self.actor_mean_bid[-1].bias.data.copy_(x_bid)
+
+        self.actor_mean_ask = nn.Sequential(
+            layer_init(nn.Linear(n_hidden_units, action_dim), std=1e-5),
+        )
+        x_ask = -1.0 * torch.ones(action_dim)
+        x_ask[-1] = 1.0
+        self.actor_mean_ask[-1].bias.data.copy_(x_ask)
+
+        self.variance_scaling = variance_scaling
+        if variance_scaling:
+            self.variance = 1.0
+        else:
+            self.log_std = nn.Parameter(torch.zeros(action_dim), requires_grad=True)
+
+        # Initialize non-LSTM layers with layer_init (LSTM has its own init)
+        for name, module in self.named_modules():
+            if not name.startswith("lstm"):
+                if isinstance(module, nn.Linear):
+                    layer_init(module)
+
+    def _encode_obs(self, x):
+        """
+        Args:
+            x: (batch, K, obs_dim)
+        Returns:
+            last_hidden: (batch, hidden_size)
+        """
+        x = torch.nan_to_num(x, nan=0.0, posinf=100.0, neginf=-100.0)
+        # LSTM output: (batch, K, hidden_size), (h_n, c_n)
+        output, _ = self.lstm(x)
+        # Take the last timestep's hidden state
+        return output[:, -1, :]
+
+    def set_variance(self, variance: float):
+        if not self.variance_scaling:
+            raise RuntimeError("set_variance is only available when variance_scaling=True")
+        v = float(variance)
+        if not np.isfinite(v):
+            raise ValueError(f"variance must be finite, got {variance}")
+        self.variance = max(v, 1e-4)
+
+    def get_variance(self) -> float:
+        if not self.variance_scaling:
+            raise RuntimeError("get_variance is only available when variance_scaling=True")
+        return float(self.variance)
+
+    def check_parameters(self):
+        for name, param in self.named_parameters():
+            if torch.isnan(param).any():
+                return True, name
+        return False, None
+
+    def get_value(self, x):
+        h = self._encode_obs(x)
+        trunk_out = self.trunk(h)
+        return self.critic(trunk_out)
+
+    def get_action_and_value(self, x, action=None, deterministic=False):
+        h = self._encode_obs(x)
+        trunk_out = self.trunk(h)
+
+        bid_mean = self.actor_mean_bid(trunk_out)
+        ask_mean = self.actor_mean_ask(trunk_out)
+
+        if self.variance_scaling:
+            bid_std = torch.ones_like(bid_mean) * self.variance
+            ask_std = torch.ones_like(ask_mean) * self.variance
+        else:
+            bid_std = torch.exp(self.log_std).expand_as(bid_mean)
+            ask_std = torch.exp(self.log_std).expand_as(ask_mean)
+
+        bid_std = torch.clamp(bid_std, min=1e-4)
+        ask_std = torch.clamp(ask_std, min=1e-4)
+        bid_mean = torch.nan_to_num(bid_mean, nan=0.0)
+        ask_mean = torch.nan_to_num(ask_mean, nan=0.0)
+
+        bid_dist = Normal(bid_mean, bid_std)
+        ask_dist = Normal(ask_mean, ask_std)
+
+        with torch.no_grad():
+            if action is None:
+                bid_base = bid_dist.sample()
+                ask_base = ask_dist.sample()
+
+                z_bid = 1 + torch.sum(torch.exp(bid_base), dim=1, keepdim=True)
+                bid_action = torch.exp(bid_base) / z_bid
+                bid_action = torch.cat((bid_action, 1 / z_bid), dim=1)
+
+                z_ask = 1 + torch.sum(torch.exp(ask_base), dim=1, keepdim=True)
+                ask_action = torch.exp(ask_base) / z_ask
+                ask_action = torch.cat((ask_action, 1 / z_ask), dim=1)
+            else:
+                bid_action, ask_action = action
+                bid_last = bid_action[:, -1].reshape(-1, 1)
+                bid_base = torch.log(bid_action[:, :-1] / bid_last)
+                ask_last = ask_action[:, -1].reshape(-1, 1)
+                ask_base = torch.log(ask_action[:, :-1] / ask_last)
+
+        bid_log_prob = bid_dist.log_prob(bid_base).sum(1)
+        ask_log_prob = ask_dist.log_prob(ask_base).sum(1)
+        log_prob_joint = bid_log_prob + ask_log_prob
+
+        bid_entropy = bid_dist.entropy().sum(1)
+        ask_entropy = ask_dist.entropy().sum(1)
+        entropy_joint = bid_entropy + ask_entropy
+
+        actions = (bid_action, ask_action)
+        return actions, log_prob_joint, entropy_joint, self.critic(trunk_out)
+
+    def deterministic_action(self, x):
+        h = self._encode_obs(x)
+        trunk_out = self.trunk(h)
+        bid_mean = self.actor_mean_bid(trunk_out)
+        ask_mean = self.actor_mean_ask(trunk_out)
+
+        with torch.no_grad():
+            z_bid = 1 + torch.sum(torch.exp(bid_mean), dim=1, keepdim=True)
+            bid_action = torch.exp(bid_mean) / z_bid
+            bid_action = torch.cat((bid_action, 1 / z_bid), dim=1)
+
+            z_ask = 1 + torch.sum(torch.exp(ask_mean), dim=1, keepdim=True)
+            ask_action = torch.exp(ask_mean) / z_ask
+            ask_action = torch.cat((ask_action, 1 / z_ask), dim=1)
+
+        return (bid_action, ask_action)
+
+
+# ==============================================================================
+# LSTM variant that processes only LOB volumes (context features bypass)
+# ==============================================================================
+
+
+class BilateralAgentLSTMLob(nn.Module):
+    """Bilateral market-making agent with LSTM over LOB volumes only.
+
+    Different from BilateralAgentLSTM: only the LOB volume time series goes
+    through the LSTM; inventory/time/drift/OFI and other context features
+    bypass the LSTM and are concatenated with the LSTM output.
+
+    Motivation: when the full obs was fed through the LSTM, training converged
+    to an overly-conservative strategy that tightly protected inventory at
+    target value 10. By isolating the LSTM to LOB temporal patterns and letting
+    context features flow directly, the LSTM is freed from having to "defend"
+    the inventory signal and can focus on temporal LOB pattern extraction.
+
+    Architecture:
+        (batch, K, obs_dim)
+            ├── LOB volumes [K, 2*n_levels]
+            │     -> LSTM(input=2*n_levels, hidden) -> last hidden (hidden,)
+            └── Context features (latest step, non-LOB)
+                  -> raw (context_dim,)
+            concat -> (hidden + context_dim,)
+            -> Shared Trunk -> Bid / Ask / Value heads
+    """
+
+    def __init__(
+        self,
+        envs,
+        n_levels: int = 5,
+        K: int = 8,
+        hidden_size: int = 64,
+        num_layers: int = 1,
+        drop_feature: str = "drift",
+        variance_scaling: bool = True,
+    ):
+        super().__init__()
+        n_hidden_units = 128
+
+        obs_space_shape = envs.single_observation_space.shape
+        assert len(obs_space_shape) == 2, (
+            f"BilateralAgentLSTMLob expects (K, obs_dim) observation space, "
+            f"got {obs_space_shape}. Wrap env with HistoryWrapper first."
+        )
+        assert obs_space_shape[0] == K, (
+            f"K mismatch: wrapper has history_len={obs_space_shape[0]}, "
+            f"agent was constructed with K={K}"
+        )
+
+        obs_dim = obs_space_shape[1]
+        action_dim = np.prod(envs.single_action_space.shape) - 1
+
+        self.K = K
+        self.n_levels = n_levels
+        self.hidden_size = hidden_size
+
+        # LOB volume indices within the flat observation (same layout as LiT)
+        base_dim = 3 if drop_feature == "drift" else 5
+        self.bid_start = base_dim + 1  # skip imbalance
+        self.bid_end = self.bid_start + n_levels
+        self.ask_start = self.bid_end
+        self.ask_end = self.ask_start + n_levels
+
+        # Context = everything except the 2*n_levels LOB volume slots
+        context_dim = obs_dim - 2 * n_levels
+        self.context_dim = context_dim
+
+        # LSTM sees only LOB volume time series (batch, K, 2*n_levels)
+        self.lstm = nn.LSTM(
+            input_size=2 * n_levels,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+        )
+        # Orthogonal init + forget-gate bias=1 (same stabilization as BilateralAgentLSTM)
+        for name, param in self.lstm.named_parameters():
+            if "weight_ih" in name:
+                nn.init.xavier_uniform_(param)
+            elif "weight_hh" in name:
+                nn.init.orthogonal_(param)
+            elif "bias_ih" in name or "bias_hh" in name:
+                nn.init.zeros_(param)
+                param.data[hidden_size : 2 * hidden_size].fill_(1.0)
+
+        trunk_input_dim = hidden_size + context_dim
+
+        self.trunk = nn.Sequential(
+            layer_init(nn.Linear(trunk_input_dim, n_hidden_units)),
+            nn.LayerNorm(n_hidden_units),
+            nn.Tanh(),
+            layer_init(nn.Linear(n_hidden_units, n_hidden_units)),
+            nn.LayerNorm(n_hidden_units),
+            nn.Tanh(),
+        )
+
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(n_hidden_units, 1), std=1.0),
+        )
+
+        self.actor_mean_bid = nn.Sequential(
+            layer_init(nn.Linear(n_hidden_units, action_dim), std=1e-5),
+        )
+        x_bid = -1.0 * torch.ones(action_dim)
+        x_bid[-1] = 1.0
+        self.actor_mean_bid[-1].bias.data.copy_(x_bid)
+
+        self.actor_mean_ask = nn.Sequential(
+            layer_init(nn.Linear(n_hidden_units, action_dim), std=1e-5),
+        )
+        x_ask = -1.0 * torch.ones(action_dim)
+        x_ask[-1] = 1.0
+        self.actor_mean_ask[-1].bias.data.copy_(x_ask)
+
+        self.variance_scaling = variance_scaling
+        if variance_scaling:
+            self.variance = 1.0
+        else:
+            self.log_std = nn.Parameter(torch.zeros(action_dim), requires_grad=True)
+
+        # Re-init non-LSTM linear layers (LSTM has its own init above)
+        for name, module in self.named_modules():
+            if not name.startswith("lstm") and isinstance(module, nn.Linear):
+                layer_init(module)
+
+    def _encode_obs(self, x):
+        """
+        Args:
+            x: (batch, K, obs_dim)
+        Returns:
+            trunk_input: (batch, hidden_size + context_dim)
+        """
+        x = torch.nan_to_num(x, nan=0.0, posinf=100.0, neginf=-100.0)
+
+        # LOB volume time series: (batch, K, 2*n_levels)
+        bid_hist = x[:, :, self.bid_start : self.bid_end]
+        ask_hist = x[:, :, self.ask_start : self.ask_end]
+        lob_hist = torch.cat([bid_hist, ask_hist], dim=-1)  # (batch, K, 2*n_levels)
+
+        # LSTM over LOB
+        lstm_out, _ = self.lstm(lob_hist)
+        last_hidden = lstm_out[:, -1, :]  # (batch, hidden_size)
+
+        # Context features: latest step's non-LOB
+        latest = x[:, -1, :]  # (batch, obs_dim)
+        before = latest[:, : self.bid_start]
+        after = latest[:, self.ask_end :]
+        context = torch.cat([before, after], dim=-1)  # (batch, context_dim)
+
+        # Concat LSTM summary with raw context
+        return torch.cat([last_hidden, context], dim=-1)
+
+    def set_variance(self, variance: float):
+        if not self.variance_scaling:
+            raise RuntimeError("set_variance is only available when variance_scaling=True")
+        v = float(variance)
+        if not np.isfinite(v):
+            raise ValueError(f"variance must be finite, got {variance}")
+        self.variance = max(v, 1e-4)
+
+    def get_variance(self) -> float:
+        if not self.variance_scaling:
+            raise RuntimeError("get_variance is only available when variance_scaling=True")
+        return float(self.variance)
+
+    def check_parameters(self):
+        for name, param in self.named_parameters():
+            if torch.isnan(param).any():
+                return True, name
+        return False, None
+
+    def get_value(self, x):
+        h = self._encode_obs(x)
+        trunk_out = self.trunk(h)
+        return self.critic(trunk_out)
+
+    def get_action_and_value(self, x, action=None, deterministic=False):
+        h = self._encode_obs(x)
+        trunk_out = self.trunk(h)
+
+        bid_mean = self.actor_mean_bid(trunk_out)
+        ask_mean = self.actor_mean_ask(trunk_out)
+
+        if self.variance_scaling:
+            bid_std = torch.ones_like(bid_mean) * self.variance
+            ask_std = torch.ones_like(ask_mean) * self.variance
+        else:
+            bid_std = torch.exp(self.log_std).expand_as(bid_mean)
+            ask_std = torch.exp(self.log_std).expand_as(ask_mean)
+
+        bid_std = torch.clamp(bid_std, min=1e-4)
+        ask_std = torch.clamp(ask_std, min=1e-4)
+        bid_mean = torch.nan_to_num(bid_mean, nan=0.0)
+        ask_mean = torch.nan_to_num(ask_mean, nan=0.0)
+
+        bid_dist = Normal(bid_mean, bid_std)
+        ask_dist = Normal(ask_mean, ask_std)
+
+        with torch.no_grad():
+            if action is None:
+                bid_base = bid_dist.sample()
+                ask_base = ask_dist.sample()
+
+                z_bid = 1 + torch.sum(torch.exp(bid_base), dim=1, keepdim=True)
+                bid_action = torch.exp(bid_base) / z_bid
+                bid_action = torch.cat((bid_action, 1 / z_bid), dim=1)
+
+                z_ask = 1 + torch.sum(torch.exp(ask_base), dim=1, keepdim=True)
+                ask_action = torch.exp(ask_base) / z_ask
+                ask_action = torch.cat((ask_action, 1 / z_ask), dim=1)
+            else:
+                bid_action, ask_action = action
+                bid_last = bid_action[:, -1].reshape(-1, 1)
+                bid_base = torch.log(bid_action[:, :-1] / bid_last)
+                ask_last = ask_action[:, -1].reshape(-1, 1)
+                ask_base = torch.log(ask_action[:, :-1] / ask_last)
+
+        bid_log_prob = bid_dist.log_prob(bid_base).sum(1)
+        ask_log_prob = ask_dist.log_prob(ask_base).sum(1)
+        log_prob_joint = bid_log_prob + ask_log_prob
+
+        bid_entropy = bid_dist.entropy().sum(1)
+        ask_entropy = ask_dist.entropy().sum(1)
+        entropy_joint = bid_entropy + ask_entropy
+
+        actions = (bid_action, ask_action)
+        return actions, log_prob_joint, entropy_joint, self.critic(trunk_out)
+
+    def deterministic_action(self, x):
+        h = self._encode_obs(x)
+        trunk_out = self.trunk(h)
+        bid_mean = self.actor_mean_bid(trunk_out)
+        ask_mean = self.actor_mean_ask(trunk_out)
+
+        with torch.no_grad():
+            z_bid = 1 + torch.sum(torch.exp(bid_mean), dim=1, keepdim=True)
+            bid_action = torch.exp(bid_mean) / z_bid
+            bid_action = torch.cat((bid_action, 1 / z_bid), dim=1)
+
             z_ask = 1 + torch.sum(torch.exp(ask_mean), dim=1, keepdim=True)
             ask_action = torch.exp(ask_mean) / z_ask
             ask_action = torch.cat((ask_action, 1 / z_ask), dim=1)
