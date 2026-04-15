@@ -4,6 +4,7 @@
 '''
 import sys
 import os
+import logging
 current = os.path.dirname(os.path.realpath(__file__))
 parent = os.path.dirname(current)
 sys.path.append(parent)
@@ -1083,10 +1084,12 @@ class RLAgent(ExecutionAgent):
 
         # Softmax transform for unconstrained/raw actions (stable)
         action = np.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
+        action = np.clip(action, -10.0, 10.0)
         action = action - np.max(action)
         exp_action = np.exp(action)
         denom = np.sum(exp_action)
         if denom <= 0 or not np.isfinite(denom):
+            logging.warning("RLAgent._normalize_action_simplex fell back to uniform simplex weights")
             return np.ones_like(exp_action, dtype=np.float32) / float(exp_action.size)
         return (exp_action / denom).astype(np.float32)
 
@@ -1219,12 +1222,6 @@ class RLAgent(ExecutionAgent):
                 remaining -= vol
             bid_target[-1] += remaining  # leftovers to inactive
 
-            # Cancel out-of-range bid orders (overflow bucket)
-            for order_id in list(lob.order_map_by_agent.get(self.agent_id, set())):
-                if order_id in lob.order_map and lob.order_map[order_id].side == 'bid':
-                    if order_id not in bid_orders_in_range or order_id in bid_orders_in_range:
-                        # Check if this order is in the overflow set (not in the level range)
-                        pass
             # Cancel bid orders outside the action_book_levels range
             for order_id in list(lob.order_map_by_agent.get(self.agent_id, set())):
                 if order_id not in bid_orders_in_range and order_id in lob.order_map and lob.order_map[order_id].side == 'bid':

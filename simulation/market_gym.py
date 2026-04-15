@@ -248,6 +248,7 @@ class Market(gym.Env):
         transition_reward = 0 
         terminal_closeout_reward = 0.0
         t = self.last_t
+        episode_start_time = getattr(self.agents[self.execution_agent_id], 'start_time', 0)
         if action is not None:
             if self.transform_action:
                 action = np.exp(action) / np.sum(np.exp(action))
@@ -311,6 +312,9 @@ class Market(gym.Env):
         inventory_reward = self._compute_inventory_reward_term()
         transition_reward += inventory_reward
 
+        elapsed_time = max(float(t - episode_start_time), 1.0)
+        normalized_time_weighted_inventory = self.time_weighted_inventory / elapsed_time
+
         exec_agent = self.agents[self.execution_agent_id]
         if hasattr(exec_agent, 'register_reward_components'):
             # Realized component is inferred from cumulative bookkeeping and excludes inventory term.
@@ -337,7 +341,7 @@ class Market(gym.Env):
                 'volume': self.agents[self.execution_agent_id].volume,
                 'net_inventory': self.agent_inventory,
                 'inventory_limit': self.inventory_max,
-                'time_weighted_inventory': self.time_weighted_inventory / (t + 1e-8),
+                'time_weighted_inventory': normalized_time_weighted_inventory,
                 'circuit_breaker': self.circuit_breaker_triggered,
                 'reward_realized_step': float(transition_reward - inventory_reward),
                 'reward_inventory_step': float(inventory_reward),
@@ -349,7 +353,7 @@ class Market(gym.Env):
         if self.execution_agent_id == 'rl_agent':
             # if rl agent is present, get an observation from the market 
             # this observation then feeds into the neural network 
-            observation = self.agents[self.execution_agent_id].get_observation(t, self.lob, self.agent_inventory, self.time_weighted_inventory / (t + 1e-8))
+            observation = self.agents[self.execution_agent_id].get_observation(t, self.lob, self.agent_inventory, normalized_time_weighted_inventory)
         else:
             # benchmark agents return no observation 
             observation = np.array([None], dtype=np.float32)            

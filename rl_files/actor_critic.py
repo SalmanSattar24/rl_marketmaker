@@ -99,7 +99,7 @@ class Args:
     """coefficient of the value function"""
     max_grad_norm: float = 0.5
     """the maximum norm for the gradient clipping"""
-    target_kl: float = None
+    target_kl: float = 0.01
     """the target KL divergence threshold"""
 
     # to be filled in runtime
@@ -518,8 +518,11 @@ class BilateralAgentAttention(nn.Module):
         n_hidden_units = 128
         super().__init__()
 
-        obs_dim = np.array(envs.single_observation_space.shape).prod()
-        action_dim = np.prod(envs.single_action_space.shape) - 1
+        obs_space = getattr(envs, 'single_observation_space', getattr(envs, 'observation_space'))
+        action_space = getattr(envs, 'single_action_space', getattr(envs, 'action_space'))
+
+        obs_dim = np.array(obs_space.shape).prod()
+        action_dim = np.prod(action_space.shape) - 1
 
         self.n_levels = n_levels
         self.drop_feature = drop_feature
@@ -745,8 +748,11 @@ class BilateralAgentLogisticNormal(nn.Module):
         n_hidden_units = 128
         super().__init__()
 
-        obs_shape = np.array(envs.single_observation_space.shape).prod()
-        action_dim = np.prod(envs.single_action_space.shape) - 1  # -1 because last component is computed from others
+        obs_space = getattr(envs, 'single_observation_space', getattr(envs, 'observation_space'))
+        action_space = getattr(envs, 'single_action_space', getattr(envs, 'action_space'))
+
+        obs_shape = np.array(obs_space.shape).prod()
+        action_dim = np.prod(action_space.shape) - 1  # -1 because last component is computed from others
 
         # SHARED TRUNK: Common feature extraction with LayerNorm for stability
         self.trunk = nn.Sequential(
@@ -1983,9 +1989,13 @@ if __name__ == "__main__":
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
             print(f' the lerning rate is {lrnow}')        
-        # manual standard deviation scalig. updated this to 0.1
+        # manual exploration variance annealing for logistic-normal / normal policies
         if args.exp_name in ('log_normal', 'normal', 'bilateral_log_normal', 'bilateral_attention'):
-            agent.variance = (0.32-1)*(iteration)/(args.num_iterations-1) + 1
+            variance_start = 1.0
+            variance_end = 0.32
+            progress = iteration / max(args.num_iterations - 1, 1)
+            scheduled_variance = variance_start + (variance_end - variance_start) * progress
+            agent.set_variance(scheduled_variance)
         # dirichlet agent does not use variance scaling 
         # agent.variance = 1 - iteration/(args.num_iterations+1) + 5e-1
         # keep same variance throughout the training
