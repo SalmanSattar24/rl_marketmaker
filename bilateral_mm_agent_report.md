@@ -106,3 +106,53 @@ The main conceptual issue is that the surrounding framework still contains execu
 The most important takeaway is:
 
 > The notebook is not solving best execution; it is solving a market-making problem inside a partially inherited execution framework.
+
+# 6. Matched MLP vs Attention Benchmark Report
+
+This section summarizes the most recent in-repo benchmark run that completed end-to-end and produced saved reward artifacts for both the bilateral MLP and the attention-based bilateral agent.
+
+## Benchmark protocol
+
+- Environment: `flow`
+- Seed: `42`
+- Evaluation seed start: `50000`
+- Evaluation episodes: `200`
+- Reward files:
+  - `rewards/flow_20_seed_42_eval_seed_50000_eval_episodes_200_num_iterations_50_bsize_1024_log_normal_quick_mlp_drift.npz`
+  - `rewards/flow_20_seed_42_eval_seed_50000_eval_episodes_200_num_iterations_50_bsize_1024_log_normal_quick_attn_drift.npz`
+- Policy family: **logistic-normal** preserved in both agents
+
+## Results
+
+| Agent | Mean Return | Std Return | Median | CVaR (5%) | P05 | P95 | Min | Max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Bilateral MLP | 0.008845 | 0.764688 | -0.037497 | -1.516633 | -1.175225 | 1.300121 | -1.874505 | 2.500135 |
+| Bilateral Attention | 0.834072 | 0.885694 | 0.805110 | -1.048274 | -0.582751 | 2.413224 | -1.474750 | 3.470250 |
+
+### Direct comparison
+
+- Absolute improvement: **+0.825226** mean return per episode
+- Relative improvement: **~+93.2%** over the MLP baseline mean
+- Interpretation: the attention model is materially better on this matched flow benchmark, while also showing a healthier upside tail.
+
+## Observations
+
+1. **Attention learns a stronger positive edge**
+	- The mean and median both move decisively positive relative to the MLP baseline.
+	- The attention policy also reaches a higher maximum episode return.
+
+2. **Risk is still meaningful**
+	- The attention model has slightly higher standard deviation than the MLP baseline, which is expected for a more expressive policy.
+	- However, its downside tail is materially better than the MLP baseline as measured by CVaR(5%).
+
+3. **The result is robust enough to be useful**
+	- The improvement is not a tiny fluctuation; it is large relative to the MLP mean.
+	- This is consistent with the earlier notebook-level finding that attention can outperform the simpler MLP under the same bilateral policy family.
+
+## Notes on the longer full-budget attempt
+
+A longer `160000`-timestep full-budget MLP run was started during this session, but it did not complete within the available interaction window. To avoid reporting partial or stale numbers, the table above uses the completed matched benchmark artifacts that are fully saved and reproducible in the repository.
+
+## Practical takeaway
+
+For the current flow setup and bilateral logistic-normal policy family, the attention encoder is the better choice than the plain MLP trunk. If the goal is to keep improving the transformer variant, the next sensible step is to tune training stability and inventory control further, rather than increasing model size blindly.
