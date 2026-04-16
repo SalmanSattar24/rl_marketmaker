@@ -1,0 +1,4 @@
+seed,file,num_iterations,mean,std,final,area
+0,quick_ppo_results_seed0.npz,12,0.0,0.0,0.0,0.0
+1,quick_ppo_results_seed1.npz,12,0.0,0.0,0.0,0.0
+2,quick_ppo_results_seed2.npz,12,0.0,0.0,0.0,0.0

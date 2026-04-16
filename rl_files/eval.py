@@ -32,7 +32,8 @@ def evaluate(
     episodic_returns = []
     while len(episodic_returns) < eval_episodes:
         with torch.no_grad():
-            actions, _, _, _ = agent.get_action_and_value(torch.Tensor(obs).to(device))
+            obs_t = torch.as_tensor(np.asarray(obs), dtype=torch.float32, device=device)
+            actions, _, _, _ = agent.get_action_and_value(obs_t)
             # actions, _, _ = agent.get_action(torch.Tensor(obs).to(device))
             next_obs, _, _, _, infos = envs.step(actions.cpu().numpy())
             # next_obs, _, _, _, infos = envs.step(actions.numpy())

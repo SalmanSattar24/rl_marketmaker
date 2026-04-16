@@ -210,8 +210,9 @@ try:
     bilateral_agent = bilateral_agent.to('cpu')
     optimizer = optim.Adam(bilateral_agent.parameters(), lr=1e-4)
 
-    # Forward pass
-    obs_batch = torch.tensor([obs] * 4, dtype=torch.float32)
+    # Forward pass - avoid creating tensor from list-of-arrays (slow); stack into numpy then tensor
+    import numpy as _np
+    obs_batch = torch.as_tensor(_np.stack([obs] * 4, axis=0), dtype=torch.float32)
     actions, log_prob, entropy, value = bilateral_agent.get_action_and_value(obs_batch)
 
     # Compute loss

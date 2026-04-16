@@ -442,7 +442,8 @@ def rollout_vectorized_rl(n_episodes, env_fns,
     # start sampling 
     observation, info = env.reset()
     while len(rewards) < n_episodes:
-        action, _, _, _ = agent.get_action_and_value(torch.Tensor(observation).to(device))
+        observation_t = torch.as_tensor(np.asarray(observation), dtype=torch.float32, device=device)
+        action, _, _, _ = agent.get_action_and_value(observation_t)
         observation, reward, terminated, truncated, infos = env.step(action.cpu().numpy())
         if "final_info" in infos:
             for info in infos["final_info"]:

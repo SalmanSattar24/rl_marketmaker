@@ -659,8 +659,9 @@ class ExecutionAgent():
     def update_position_from_message_list(self, message_list):
         rewards = [self.update_position(m) for m in message_list]
         # Bilateral MM: volume can go negative (short), so no assert >= 0
-        # Episode terminates when inventory is completely liquidated (volume == 0)
-        # For bilateral MM agents (RLAgent), termination is time-based, not volume-based
+        # Default behavior: benchmark execution agents terminate when volume==0.
+        # RLAgent (bilateral market-making) should NOT auto-terminate based on
+        # remaining volume — termination is time-based and handled by the env.
         terminated = self.volume == 0
         return sum(rewards), terminated
 
@@ -751,15 +752,20 @@ class ExecutionAgent():
         return 0
     
     def sell_remaining_position(self, lob, time):
-        assert self.agent_id, 'agent id is not set' 
-        assert self.volume > 0, 'volume is 0'
-        # assert lob.order_map_by_agent[self.agent_id], 'agent has no orders in the book'
-        # assert self.agent_id in lob.order_map_by_agent, 'agent has no orders in the book'
+        assert self.agent_id, 'agent id is not set'
+        # Cancel all resting orders first
         order_list = []
-        for order_id in lob.order_map_by_agent[self.agent_id]:
+        for order_id in list(lob.order_map_by_agent.get(self.agent_id, set())):
             order_list.append(Cancellation(agent_id=self.agent_id, order_id=order_id, time=time))
-        order_list.append(MarketOrder(agent_id=self.agent_id, side='bid', volume=self.volume, time=time))
-        return order_list
+
+        # If we have a non-zero net volume, flatten aggressively with a market order.
+        # Support both long (volume>0 -> sell) and short (volume<0 -> buy) positions.
+        if self.volume > 0:
+            order_list.append(MarketOrder(agent_id=self.agent_id, side='bid', volume=self.volume, time=time))
+        elif self.volume < 0:
+            order_list.append(MarketOrder(agent_id=self.agent_id, side='ask', volume=abs(self.volume), time=time))
+
+        return order_list if order_list else None
 
 class MarketAgent(ExecutionAgent):
 
@@ -1222,10 +1228,13 @@ class RLAgent(ExecutionAgent):
                 remaining -= vol
             bid_target[-1] += remaining  # leftovers to inactive
 
-            # Cancel bid orders outside the action_book_levels range
-            for order_id in list(lob.order_map_by_agent.get(self.agent_id, set())):
+            # Cancel bid orders outside the action_book_levels range (collect then insert once)
+            bid_orders_to_cancel = set()
+            for order_id in lob.order_map_by_agent.get(self.agent_id, set()):
                 if order_id not in bid_orders_in_range and order_id in lob.order_map and lob.order_map[order_id].side == 'bid':
-                    order_list.insert(0, Cancellation(self.agent_id, order_id, time))
+                    bid_orders_to_cancel.add(order_id)
+            for order_id in bid_orders_to_cancel:
+                order_list.insert(0, Cancellation(self.agent_id, order_id, time))
 
             # Incremental update for each bid level: cancel diff or place diff
             for level in range(self.action_book_levels):
@@ -1258,10 +1267,13 @@ class RLAgent(ExecutionAgent):
                 remaining -= vol
             ask_target[-1] += remaining
 
-            # Cancel ask orders outside range
-            for order_id in list(lob.order_map_by_agent.get(self.agent_id, set())):
+            # Cancel ask orders outside range (collect then insert once)
+            ask_orders_to_cancel = set()
+            for order_id in lob.order_map_by_agent.get(self.agent_id, set()):
                 if order_id not in ask_orders_in_range and order_id in lob.order_map and lob.order_map[order_id].side == 'ask':
-                    order_list.insert(0, Cancellation(self.agent_id, order_id, time))
+                    ask_orders_to_cancel.add(order_id)
+            for order_id in ask_orders_to_cancel:
+                order_list.insert(0, Cancellation(self.agent_id, order_id, time))
 
             # Incremental update for each ask level
             for level in range(self.action_book_levels):
@@ -1507,11 +1519,15 @@ class RLAgent(ExecutionAgent):
         time_weighted_inventory = float(np.clip(time_weighted_inventory, 0.0, 1.0))
         inventory_features = np.array([norm_inventory, time_weighted_inventory], dtype=np.float32)
 
+        # Replace legacy execution-style remaining-volume feature with
+        # market-making relevant active order utilization.
+        active_utilization = float(np.clip(self.active_volume / (self.initial_volume + 1e-8), 0.0, 1.0))
+
         if self.drop_feature == 'drift':
             # dropping drift from base features
-            observation = np.array([time/self.terminal_time, self.volume/self.initial_volume, spread], dtype=np.float32)
+            observation = np.array([time/self.terminal_time, active_utilization, spread], dtype=np.float32)
         else:
-            observation = np.array([time/self.terminal_time, self.volume/self.initial_volume, bid_price_drift, mid_price_drift, spread], dtype=np.float32)
+            observation = np.array([time/self.terminal_time, active_utilization, bid_price_drift, mid_price_drift, spread], dtype=np.float32)
 
         # volume features and order distribution features and
         if self.drop_feature == 'volume':
@@ -1541,8 +1557,7 @@ class RLAgent(ExecutionAgent):
         observation = np.concatenate([observation, inventory_features], dtype=np.float32)
 
         # FINAL CLEANING: Remove NaNs and clip to prevent explosive values
-        observation = np.nan_to_num(observation, nan=0.0, posinf=100.0, neginf=-100.0)
-        observation = np.clip(observation, -100.0, 100.0)
+        observation = self._finalize_observation(observation)
 
         if observation.shape[0] != self.observation_space_length:
             raise ValueError(
@@ -1550,6 +1565,16 @@ class RLAgent(ExecutionAgent):
                 f"drop_feature={self.drop_feature}, obs_levels={self.observation_book_levels}, volume={self.initial_volume}, use_ofi={self.use_ofi}"
             )
 
+        return observation
+
+    def _finalize_observation(self, observation):
+        """Sanitize and clip observation features to stable numeric ranges.
+
+        Centralizes the final cleaning step so downstream callers can reuse it
+        and so tests can validate observation hygiene in one place.
+        """
+        observation = np.nan_to_num(observation, nan=0.0, posinf=100.0, neginf=-100.0)
+        observation = np.clip(observation, -100.0, 100.0)
         return observation
     
     def get_order_allocation(self, lob, n_levels, start_at_best_price=False):
@@ -1649,6 +1674,18 @@ class RLAgent(ExecutionAgent):
         bid_volumes.append(bid_overflow)
 
         return bid_volumes, bid_orders, ask_volumes, ask_orders
+
+    def update_position_from_message_list(self, message_list):
+        """RLAgent overrides the execution-agent termination rule.
+
+        The generic ExecutionAgent terminates an episode when its volume hits
+        zero. For bilateral market-making (RLAgent) we want time-based
+        termination only (episode end at terminal_time). Prevent auto-termination
+        so the environment can perform deterministic terminal closeout.
+        """
+        rewards = [self.update_position(m) for m in message_list]
+        # Do NOT terminate based on self.volume for RLAgent; env will handle termination
+        return sum(rewards), False
 
     def new_event(self, time, event):
         assert event == self.agent_id

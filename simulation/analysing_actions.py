@@ -65,7 +65,7 @@ for env_type in ['noise', 'flow', 'strategic']:
         start_time = time.time()
         while len(list_of_actions) < N:
             with torch.no_grad():
-                obs = torch.Tensor(obs).to(device)  
+                obs = torch.as_tensor(np.asarray(obs), dtype=torch.float32, device=device)
                 # print(obs.device)
                 if tag == 'deterministic_action':
                     actions = agent.deterministic_action(obs)

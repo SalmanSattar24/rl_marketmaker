@@ -72,11 +72,11 @@ class Args:
     """the lambda for the general advantage estimation"""
     num_minibatches: int = 1
     """the number of mini-batches"""
-    update_epochs: int = 1
+    update_epochs: int = 4
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
-    clip_coef: float = 0.1
+    clip_coef: float = 0.2
     """the surrogate clipping coefficient"""
     clip_vloss: bool = False
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
@@ -85,7 +85,7 @@ class Args:
     vf_coef: float = 0.5
     """coefficient of the value function"""
     # max_grad_norm: float = 0.5
-    max_grad_norm: float = 100
+    max_grad_norm: float = 0.5
     """the maximum norm for the gradient clipping"""
     target_kl: float = None
     """the target KL divergence threshold"""
@@ -283,7 +283,7 @@ if __name__ == "__main__":
     global_step = 0
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
-    next_obs = torch.Tensor(next_obs).to(device) 
+    next_obs = torch.as_tensor(np.asarray(next_obs), dtype=torch.float32, device=device)
     next_done = torch.zeros(args.num_envs).to(device)
 
     for iteration in range(1, args.num_iterations + 1):
@@ -312,8 +312,9 @@ if __name__ == "__main__":
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
             next_done = np.logical_or(terminations, truncations)
-            rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
+            rewards[step] = torch.as_tensor(np.asarray(reward), dtype=torch.float32, device=device).view(-1)
+            next_obs = torch.as_tensor(np.asarray(next_obs), dtype=torch.float32, device=device)
+            next_done = torch.as_tensor(np.asarray(next_done), dtype=torch.float32, device=device)
 
             if "final_info" in infos:
                 for info in infos["final_info"]:

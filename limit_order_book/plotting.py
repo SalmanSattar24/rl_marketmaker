@@ -7,6 +7,12 @@ sys.path.append(parent_dir)
 # import 
 import numpy as np
 # from advanced_multi_lot import Market 
+import matplotlib
+# Use a non-interactive backend by default so plotting utilities work in
+# headless environments (e.g., CI/pytest). Users can still override this by
+# setting MPLBACKEND explicitly before importing this module.
+if not os.environ.get("MPLBACKEND"):
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import cm 
 import pandas as pd 

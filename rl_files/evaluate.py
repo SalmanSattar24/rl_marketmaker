@@ -101,7 +101,7 @@ for exp_name in ['log_normal']:
             n_eval_episodes = 10000
             while len(episodic_returns) < n_eval_episodes:
                 with torch.no_grad():
-                    obs = torch.Tensor(obs).to(device)  
+                    obs = torch.as_tensor(np.asarray(obs), dtype=torch.float32, device=device)
                     # print(obs.device)
                     # actions, _, _, _ = agent.get_action_and_value(obs)
                     # this only works for logistic normal agent
