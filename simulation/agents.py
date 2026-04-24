@@ -1198,6 +1198,12 @@ class RLAgent(ExecutionAgent):
             best_bid = lob.get_best_price('bid')
             best_ask = lob.get_best_price('ask')
 
+            # Fallback for empty book sides
+            if np.isnan(best_bid) or best_bid <= 0:
+                best_bid = getattr(self, 'reference_bid_price', 100.0)
+            if np.isnan(best_ask) or best_ask <= 0:
+                best_ask = getattr(self, 'reference_ask_price', 101.0)
+
             # Get current bilateral allocation (what we already have in the book)
             curr_bid_vols, bid_orders_in_range, curr_ask_vols, ask_orders_in_range = \
                 self.get_bilateral_order_allocation(lob, self.action_book_levels)

@@ -54,7 +54,8 @@ The simulator supports three market regimes: `noise`, `flow`, and `strategic`.
 | **Ablation framework** | Automated 4×3 experiment matrix: MLP/Transformer × no-fee/fee × noise/flow/strategic |
 | **Parallel training** | 32–128 parallel `SyncVectorEnv` environments |
 | **TensorBoard logging** | Loss, KL divergence, clip fraction, episode return |
-| **29 passing tests** | Full regression suite covering environment, agent, and training path |
+| **Training health artifacts** | Per-iteration JSON health bundle under `results/training_health/` + action-contract diagnostics |
+| **67 passing tests** | Full regression suite covering environment, agent, and training path |
 
 ---
 
@@ -203,7 +204,7 @@ The notebook runs fully locally — no Google Colab or Google Drive required.
 python -m pytest -q tests/
 ```
 
-Expected result: **29 passed**
+Expected result: **67 passed**
 
 Key test files:
 
@@ -215,6 +216,7 @@ Key test files:
 | `test_bugfix_audit.py` | Regression checks for known fixed bugs |
 | `test_phase2_integration.py` | Full environment integration |
 | `test_phase3_training.py` | Training loop forward/backward pass |
+| `test_phase4_metrics_and_contract.py` | Simplex contract guards + evaluation metrics bundle validation |
 
 ---
 

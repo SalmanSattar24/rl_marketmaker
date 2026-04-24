@@ -1,5 +1,6 @@
 import os
 import random
+import json
 from dataclasses import dataclass
 import time
 from typing import Optional
@@ -114,6 +115,78 @@ def make_env(config):
     def thunk():
         return Market(config)
     return thunk
+
+
+def _safe_simplex_projection(action: torch.Tensor, inactive_index: int = -1, eps: float = 1e-8) -> torch.Tensor:
+    """Project action tensor to valid simplex rows with finite, non-negative entries.
+
+    This enforces the policy contract used by bilateral quoting heads before passing
+    actions to the environment.
+    """
+    x = torch.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
+    x = torch.clamp(x, min=0.0)
+
+    if x.dim() == 1:
+        total = x.sum()
+        if (not torch.isfinite(total)) or total <= eps:
+            x[:] = 0.0
+            x[inactive_index] = 1.0
+        else:
+            x = x / total
+        return x
+
+    total = x.sum(dim=1, keepdim=True)
+    bad_mask = (~torch.isfinite(total.squeeze(1))) | (total.squeeze(1) <= eps)
+    x = x / (total + eps)
+    if torch.any(bad_mask):
+        x[bad_mask] = 0.0
+        x[bad_mask, inactive_index] = 1.0
+    x = x / (x.sum(dim=1, keepdim=True) + eps)
+    return x
+
+
+def _invalid_simplex_row_count(action: torch.Tensor, tol: float = 1e-4) -> int:
+    """Count rows violating simplex contract (finite, non-negative, sum≈1)."""
+    x = action
+    if x.dim() == 1:
+        x = x.unsqueeze(0)
+    finite_ok = torch.isfinite(x).all(dim=1)
+    nonneg_ok = (x >= -tol).all(dim=1)
+    sum_ok = (x.sum(dim=1) - 1.0).abs() <= tol
+    valid = finite_ok & nonneg_ok & sum_ok
+    return int((~valid).sum().item())
+
+
+def _compute_reward_metrics(rewards: np.ndarray) -> dict:
+    """Compute a stable evaluation metrics bundle from episodic rewards."""
+    if rewards.size == 0:
+        return {
+            "num_episodes": 0,
+            "mean": float("nan"),
+            "std": float("nan"),
+            "median": float("nan"),
+            "p05": float("nan"),
+            "p95": float("nan"),
+            "cvar05": float("nan"),
+            "min": float("nan"),
+            "max": float("nan"),
+            "outlier_rate_lt_minus200": float("nan"),
+        }
+
+    sorted_rewards = np.sort(rewards)
+    k = max(1, int(np.ceil(0.05 * len(sorted_rewards))))
+    return {
+        "num_episodes": int(rewards.size),
+        "mean": float(np.mean(rewards)),
+        "std": float(np.std(rewards)),
+        "median": float(np.median(rewards)),
+        "p05": float(np.percentile(rewards, 5)),
+        "p95": float(np.percentile(rewards, 95)),
+        "cvar05": float(np.mean(sorted_rewards[:k])),
+        "min": float(np.min(rewards)),
+        "max": float(np.max(rewards)),
+        "outlier_rate_lt_minus200": float(np.mean(rewards < -200.0)),
+    }
 
 class PinnedMemoryBuffer:
     """Helper class for efficient CPU↔GPU transfers using pinned memory"""
@@ -1868,6 +1941,13 @@ if __name__ == "__main__":
 
     summary_path = f"{parent_dir}/tensorboard_logs/{run_name}"
     print(f'writing summary to {summary_path}:')
+
+    # Standard artifact directories across notebook/script entry paths.
+    os.makedirs(f"{parent_dir}/models", exist_ok=True)
+    os.makedirs(f"{parent_dir}/rewards", exist_ok=True)
+    os.makedirs(f"{parent_dir}/tensorboard_logs", exist_ok=True)
+    os.makedirs(f"{parent_dir}/results/training_health", exist_ok=True)
+
     writer = SummaryWriter(summary_path)
     writer.add_text(
         "hyperparameters",
@@ -1978,12 +2058,16 @@ if __name__ == "__main__":
     if args.num_iterations < 2: 
         raise ValueError('num_iterations should be greater than 1')
 
+    training_health_rows = []
+
     for iteration in range(0, args.num_iterations):
         print(f'iteration={iteration}')
         # Annealing the rate if instructed to do so.
         returns = []
         times = []
         drifts = []
+        action_rows_total = 0
+        action_rows_invalid_pre = 0
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
@@ -2017,6 +2101,16 @@ if __name__ == "__main__":
             if args.bilateral:
                 # action is tuple (bid_action, ask_action)
                 bid_action, ask_action = action
+
+                # Phase C: enforce action contract centrally before env interaction.
+                invalid_bid_pre = _invalid_simplex_row_count(bid_action)
+                invalid_ask_pre = _invalid_simplex_row_count(ask_action)
+                action_rows_invalid_pre += invalid_bid_pre + invalid_ask_pre
+                action_rows_total += int(bid_action.shape[0] * 2)
+
+                bid_action = _safe_simplex_projection(bid_action)
+                ask_action = _safe_simplex_projection(ask_action)
+
                 bid_actions[step] = bid_action
                 ask_actions[step] = ask_action
                 # Flatten to (num_envs, 14) for SyncVectorEnv compatibility
@@ -2100,15 +2194,32 @@ if __name__ == "__main__":
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
-        # Optimizing the policy and value network
+        # Optimizing the policy and value network (Phase A stability hardening)
         b_inds = np.arange(args.batch_size)
         clipfracs = []
+        attempted_updates = 0
+        applied_updates = 0
+        skipped_nonfinite = 0
+        stopped_on_kl = 0
+
+        last_old_approx_kl = torch.tensor(0.0, device=device)
+        last_approx_kl = torch.tensor(0.0, device=device)
+        last_pg_loss = torch.tensor(0.0, device=device)
+        last_v_loss = torch.tensor(0.0, device=device)
+        last_entropy_loss = torch.tensor(0.0, device=device)
+        last_total_loss = torch.tensor(0.0, device=device)
+        last_grad_norm = 0.0
+
+        stop_update_phase = False
         for epoch in range(args.update_epochs):
             # shuffle indices could be removed since we are doing only one epoch
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
+                if stop_update_phase:
+                    break
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
+                attempted_updates += 1
 
                 # log probs are computed with old actions
                 if args.bilateral:
@@ -2123,11 +2234,29 @@ if __name__ == "__main__":
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
+                # Guard 1: Skip minibatch if core PPO tensors are non-finite
+                if not (
+                    torch.isfinite(newlogprob).all()
+                    and torch.isfinite(entropy).all()
+                    and torch.isfinite(newvalue).all()
+                    and torch.isfinite(logratio).all()
+                    and torch.isfinite(ratio).all()
+                ):
+                    skipped_nonfinite += 1
+                    continue
+
                 with torch.no_grad():
                     # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+
+                if not (torch.isfinite(old_approx_kl) and torch.isfinite(approx_kl)):
+                    skipped_nonfinite += 1
+                    continue
+
+                last_old_approx_kl = old_approx_kl.detach()
+                last_approx_kl = approx_kl.detach()
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
@@ -2158,12 +2287,44 @@ if __name__ == "__main__":
                 # Total loss: policy loss + value loss - entropy bonus (negative to maximize entropy)
                 loss = pg_loss + v_loss * args.vf_coef - entropy_loss * args.ent_coef
 
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
+                # Guard 2: Skip minibatch if objective is non-finite
+                if not (
+                    torch.isfinite(pg_loss)
+                    and torch.isfinite(v_loss)
+                    and torch.isfinite(entropy_loss)
+                    and torch.isfinite(loss)
+                ):
+                    skipped_nonfinite += 1
+                    continue
 
-            if args.target_kl is not None and approx_kl > args.target_kl:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+
+                grad_norm = nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                grad_norm_val = float(grad_norm.detach().item()) if torch.is_tensor(grad_norm) else float(grad_norm)
+
+                # Guard 3: Skip step if grad norm is non-finite
+                if not np.isfinite(grad_norm_val):
+                    optimizer.zero_grad(set_to_none=True)
+                    skipped_nonfinite += 1
+                    continue
+
+                optimizer.step()
+                applied_updates += 1
+
+                last_pg_loss = pg_loss.detach()
+                last_v_loss = v_loss.detach()
+                last_entropy_loss = entropy_loss.detach()
+                last_total_loss = loss.detach()
+                last_grad_norm = grad_norm_val
+
+                # KL early stop: break out immediately when threshold is exceeded
+                if args.target_kl is not None and last_approx_kl > args.target_kl:
+                    stop_update_phase = True
+                    stopped_on_kl = 1
+                    break
+
+            if stop_update_phase:
                 break
 
 
@@ -2171,21 +2332,62 @@ if __name__ == "__main__":
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
+        update_ratio = applied_updates / max(attempted_updates, 1)
+
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-        writer.add_scalar("losses/total_loss", loss, global_step)
-        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
+        writer.add_scalar("losses/value_loss", float(last_v_loss.item()), global_step)
+        writer.add_scalar("losses/policy_loss", float(last_pg_loss.item()), global_step)
+        writer.add_scalar("losses/total_loss", float(last_total_loss.item()), global_step)
+        writer.add_scalar("losses/entropy", float(last_entropy_loss.item()), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
+        writer.add_scalar("losses/old_approx_kl", float(last_old_approx_kl.item()), global_step)
+        writer.add_scalar("losses/approx_kl", float(last_approx_kl.item()), global_step)
+        writer.add_scalar("losses/clipfrac", float(np.mean(clipfracs)) if len(clipfracs) > 0 else 0.0, global_step)
+        writer.add_scalar("health/grad_norm", float(last_grad_norm), global_step)
+        writer.add_scalar("health/updates_attempted", attempted_updates, global_step)
+        writer.add_scalar("health/updates_applied", applied_updates, global_step)
+        writer.add_scalar("health/updates_skipped_nonfinite", skipped_nonfinite, global_step)
+        writer.add_scalar("health/update_ratio", update_ratio, global_step)
+        writer.add_scalar("health/kl_early_stop", stopped_on_kl, global_step)
+
+        if args.bilateral:
+            action_invalid_rate_pre = action_rows_invalid_pre / max(action_rows_total, 1)
+            writer.add_scalar("health/action_invalid_rows_pre_sanitize", action_rows_invalid_pre, global_step)
+            writer.add_scalar("health/action_invalid_rate_pre_sanitize", action_invalid_rate_pre, global_step)
+        else:
+            action_invalid_rate_pre = float('nan')
+
+        training_health_rows.append({
+            "iteration": int(iteration),
+            "global_step": int(global_step),
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            "approx_kl": float(last_approx_kl.item()),
+            "old_approx_kl": float(last_old_approx_kl.item()),
+            "clipfrac": float(np.mean(clipfracs)) if len(clipfracs) > 0 else 0.0,
+            "grad_norm": float(last_grad_norm),
+            "updates_attempted": int(attempted_updates),
+            "updates_applied": int(applied_updates),
+            "updates_skipped_nonfinite": int(skipped_nonfinite),
+            "update_ratio": float(update_ratio),
+            "kl_early_stop": bool(stopped_on_kl),
+            "action_invalid_rows_pre_sanitize": int(action_rows_invalid_pre),
+            "action_invalid_rate_pre_sanitize": float(action_invalid_rate_pre) if args.bilateral else None,
+        })
 
         # Log variance only for agents that have variance scaling
         if hasattr(agent, 'variance') and args.exp_name in ('log_normal', 'normal', 'bilateral_log_normal', 'bilateral_attention'):
             writer.add_scalar("values/variance", agent.variance, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+    health_path = f"{parent_dir}/results/training_health/{run_name}.json"
+    with open(health_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "run_name": run_name,
+            "num_iterations": int(args.num_iterations),
+            "rows": training_health_rows,
+        }, f, indent=2)
+    print(f"training health saved to {health_path}")
 
     if args.save_model:
         model_path = f"{parent_dir}/models/{run_name}.pt"        
@@ -2225,6 +2427,8 @@ if __name__ == "__main__":
                 if args.bilateral:
                     # actions is tuple (bid_action, ask_action)
                     bid_action, ask_action = actions
+                    bid_action = _safe_simplex_projection(bid_action)
+                    ask_action = _safe_simplex_projection(ask_action)
                     env_actions = (bid_action.squeeze(0).cpu().numpy(), ask_action.squeeze(0).cpu().numpy())
                 else:
                     env_actions = actions.squeeze(0).cpu().numpy()
@@ -2266,6 +2470,28 @@ if __name__ == "__main__":
             file_name = f'{parent_dir}/rewards/{args.run_name}.npz'
             print(f'save rewards to {file_name}')
             np.savez(file_name, rewards=rewards)
+
+            metrics = _compute_reward_metrics(rewards)
+            metrics_bundle = {
+                "run_name": args.run_name,
+                "env_type": args.env_type,
+                "num_lots": int(args.num_lots),
+                "seed": int(args.seed),
+                "eval_seed": int(args.eval_seed),
+                "terminal_time": int(args.terminal_time),
+                "time_delta": int(args.time_delta),
+                "drop_feature": args.drop_feature,
+                "maker_rebate": float(args.maker_rebate),
+                "taker_fee": float(args.taker_fee),
+                "exp_name": args.exp_name,
+                "bilateral": bool(args.bilateral),
+                "attention": bool(args.attention),
+                "metrics": metrics,
+            }
+            metrics_file = f'{parent_dir}/rewards/{args.run_name}_metrics.json'
+            with open(metrics_file, 'w', encoding='utf-8') as f:
+                json.dump(metrics_bundle, f, indent=2)
+            print(f'save reward metrics to {metrics_file}')
         # if args.tag is not None:
         #     file_name = f'{parent_dir}/rewards/{args.run_name}_{args.tag}.npz'
         # else:
