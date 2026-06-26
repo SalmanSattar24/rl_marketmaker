@@ -1,10 +1,5 @@
-try:
-    from .limit_order_book import LimitOrderBook, LimitOrder, MarketOrder, Cancellation
-    from .plotting import plot_prices, plot_average_book_shape, heat_map
-except ImportError:
-    # Fallback for direct script execution
-    from limit_order_book import LimitOrderBook, LimitOrder, MarketOrder, Cancellation
-    from plotting import plot_prices, plot_average_book_shape, heat_map
+from limit_order_book.limit_order_book import LimitOrderBook, LimitOrder, MarketOrder, Cancellation
+from limit_order_book.plotting import plot_prices, plot_average_book_shape, heat_map
 import matplotlib.pyplot as plt
 
 

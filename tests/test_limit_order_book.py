@@ -1,4 +1,4 @@
-from limit_order_book import LimitOrderBook, LimitOrder, MarketOrder, Cancellation, Modification, CancellationByPriceVolume
+from limit_order_book.limit_order_book import LimitOrderBook, LimitOrder, MarketOrder, Cancellation, Modification, CancellationByPriceVolume
 import unittest
 import numpy as np
 
