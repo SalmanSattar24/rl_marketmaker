@@ -1,5 +1,7 @@
 # rl_marketmaker
 
+> **For employers:** [start with the simulator and RL review guide](docs/EMPLOYER_GUIDE.md). Historical test counts are checkpoint-specific; simulated behavior is not demonstrated live profitability.
+
 `rl_marketmaker` is a research-oriented reinforcement learning project for **limit-order-book (LOB) market making and trade execution**.  
 It combines a custom microstructure simulator, Gym-style environments, baseline agents, bilateral RL policy code, and reproducible tests.
 
